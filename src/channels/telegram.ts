@@ -1,9 +1,12 @@
+import fs from 'fs';
+import path from 'path';
 import https from 'https';
-import { Api, Bot } from 'grammy';
+import { Api, Bot, InputFile } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
+import { resolveGroupFolderPath } from '../group-folder.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
@@ -11,6 +14,93 @@ import {
   OnInboundMessage,
   RegisteredGroup,
 } from '../types.js';
+
+const MAX_DOWNLOAD_SIZE = 10 * 1024 * 1024; // 10MB
+
+async function transcribeAudioFile(filePath: string): Promise<string | null> {
+  const { readEnvFile: readEnv } = await import('../env.js');
+  const secrets = readEnv(['OPENAI_API_KEY']);
+  if (!secrets.OPENAI_API_KEY) return null;
+
+  try {
+    const audioBuffer = fs.readFileSync(filePath);
+    const fileName = path.basename(filePath);
+
+    const boundary = `----nanoclaw-${Date.now()}`;
+    const parts: Buffer[] = [];
+
+    parts.push(Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-1\r\n`
+    ));
+    parts.push(Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`
+    ));
+    parts.push(audioBuffer);
+    parts.push(Buffer.from('\r\n'));
+    parts.push(Buffer.from(`--${boundary}--\r\n`));
+
+    const body = Buffer.concat(parts);
+
+    const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${secrets.OPENAI_API_KEY}`,
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+      },
+      body,
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      logger.error({ status: res.status, errText }, 'Whisper transcription failed');
+      return null;
+    }
+
+    const data = await res.json() as { text: string };
+    return data.text;
+  } catch (err) {
+    logger.error({ err }, 'Whisper transcription error');
+    return null;
+  }
+}
+
+async function downloadTelegramFile(
+  bot: Bot,
+  fileId: string,
+  groupFolder: string,
+  filename: string,
+): Promise<string | null> {
+  try {
+    const file = await bot.api.getFile(fileId);
+    if (!file.file_path) throw new Error('No file_path returned');
+
+    // Telegram file size check
+    if (file.file_size && file.file_size > MAX_DOWNLOAD_SIZE) {
+      logger.warn({ fileId, size: file.file_size }, 'Telegram file too large, skipping');
+      return null;
+    }
+
+    const url = `https://api.telegram.org/file/bot${bot.token}/${file.file_path}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const buffer = Buffer.from(await res.arrayBuffer());
+    if (buffer.length > MAX_DOWNLOAD_SIZE) return null;
+
+    const groupDir = resolveGroupFolderPath(groupFolder);
+    const attachDir = path.join(groupDir, 'attachments');
+    fs.mkdirSync(attachDir, { recursive: true });
+
+    const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const destPath = path.join(attachDir, `${Date.now()}-${safeName}`);
+    fs.writeFileSync(destPath, buffer);
+
+    return `/workspace/group/attachments/${path.basename(destPath)}`;
+  } catch (err) {
+    logger.error({ fileId, err }, 'Failed to download Telegram file');
+    return null;
+  }
+}
 
 export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
@@ -165,7 +255,7 @@ export class TelegramChannel implements Channel {
       );
     });
 
-    // Handle non-text messages with placeholders so the agent knows something was sent
+    // Handle non-text messages — download files when possible
     const storeNonText = (ctx: any, placeholder: string) => {
       const chatJid = `tg:${ctx.chat.id}`;
       const group = this.opts.registeredGroups()[chatJid];
@@ -199,14 +289,136 @@ export class TelegramChannel implements Channel {
       });
     };
 
-    this.bot.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
-    this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
-    this.bot.on('message:voice', (ctx) => storeNonText(ctx, '[Voice message]'));
-    this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
-    this.bot.on('message:document', (ctx) => {
-      const name = ctx.message.document?.file_name || 'file';
-      storeNonText(ctx, `[Document: ${name}]`);
+    this.bot.on('message:photo', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      // Get largest photo size
+      const photos = ctx.message.photo;
+      const largest = photos[photos.length - 1];
+      const localPath = await downloadTelegramFile(
+        this.bot!, largest.file_id, group.folder, 'photo.jpg',
+      );
+
+      const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
+      const content = localPath ? `[Image: ${localPath}]${caption}` : `[Photo]${caption}`;
+
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName = ctx.from?.first_name || ctx.from?.username || 'Unknown';
+      const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(chatJid, timestamp, undefined, 'telegram', isGroup);
+      this.opts.onMessage(chatJid, {
+        id: ctx.message.message_id.toString(),
+        chat_jid: chatJid,
+        sender: ctx.from?.id?.toString() || '',
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+      });
+      logger.info({ chatJid, hasFile: !!localPath }, 'Telegram photo stored');
     });
+
+    this.bot.on('message:document', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const doc = ctx.message.document!;
+      const name = doc.file_name || 'document';
+      const localPath = await downloadTelegramFile(
+        this.bot!, doc.file_id, group.folder, name,
+      );
+
+      const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
+      const content = localPath ? `[File: ${localPath}]${caption}` : `[Document: ${name}]${caption}`;
+
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName = ctx.from?.first_name || ctx.from?.username || 'Unknown';
+      const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(chatJid, timestamp, undefined, 'telegram', isGroup);
+      this.opts.onMessage(chatJid, {
+        id: ctx.message.message_id.toString(),
+        chat_jid: chatJid,
+        sender: ctx.from?.id?.toString() || '',
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+      });
+      logger.info({ chatJid, hasFile: !!localPath }, 'Telegram document stored');
+    });
+
+    this.bot.on('message:voice', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const voice = ctx.message.voice!;
+      const localPath = await downloadTelegramFile(
+        this.bot!, voice.file_id, group.folder, 'voice.ogg',
+      );
+
+      let content = localPath ? `[Voice: ${localPath}]` : '[Voice message]';
+
+      // Transcribe voice message
+      if (localPath) {
+        const groupDir = resolveGroupFolderPath(group.folder);
+        const hostPath = path.join(groupDir, 'attachments', path.basename(localPath));
+        const transcript = await transcribeAudioFile(hostPath);
+        if (transcript) {
+          content = `[Voice transcript: "${transcript}"]`;
+          logger.info({ chatJid, transcriptLength: transcript.length }, 'Voice message transcribed');
+        }
+      }
+
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName = ctx.from?.first_name || ctx.from?.username || 'Unknown';
+      const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(chatJid, timestamp, undefined, 'telegram', isGroup);
+      this.opts.onMessage(chatJid, {
+        id: ctx.message.message_id.toString(),
+        chat_jid: chatJid,
+        sender: ctx.from?.id?.toString() || '',
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+      });
+      logger.info({ chatJid, hasFile: !!localPath }, 'Telegram voice stored');
+    });
+
+    this.bot.on('message:audio', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const audio = ctx.message.audio!;
+      const name = audio.file_name || 'audio.mp3';
+      const localPath = await downloadTelegramFile(
+        this.bot!, audio.file_id, group.folder, name,
+      );
+
+      const content = localPath ? `[Audio: ${localPath}]` : `[Audio: ${name}]`;
+
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName = ctx.from?.first_name || ctx.from?.username || 'Unknown';
+      const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(chatJid, timestamp, undefined, 'telegram', isGroup);
+      this.opts.onMessage(chatJid, {
+        id: ctx.message.message_id.toString(),
+        chat_jid: chatJid,
+        sender: ctx.from?.id?.toString() || '',
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+      });
+      logger.info({ chatJid, hasFile: !!localPath }, 'Telegram audio stored');
+    });
+
+    this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
     this.bot.on('message:sticker', (ctx) => {
       const emoji = ctx.message.sticker?.emoji || '';
       storeNonText(ctx, `[Sticker ${emoji}]`);
@@ -288,6 +500,18 @@ export class TelegramChannel implements Channel {
       await this.bot.api.sendChatAction(numericId, 'typing');
     } catch (err) {
       logger.debug({ jid, err }, 'Failed to send Telegram typing indicator');
+    }
+  }
+
+  async sendVoice(jid: string, filePath: string): Promise<void> {
+    if (!this.bot) return;
+    try {
+      const numericId = jid.replace(/^tg:/, '');
+      const audioData = fs.readFileSync(filePath);
+      await this.bot.api.sendVoice(numericId, new InputFile(audioData, path.basename(filePath)));
+      logger.info({ jid }, 'Telegram voice message sent');
+    } catch (err) {
+      logger.error({ jid, err }, 'Failed to send Telegram voice message');
     }
   }
 }

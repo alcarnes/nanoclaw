@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nanoclaw.refresh-oauth</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/acarnes/second-brain/nanoclaw/scripts/refresh-oauth.sh</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/acarnes/second-brain/nanoclaw/logs/refresh-oauth.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/acarnes/second-brain/nanoclaw/logs/refresh-oauth.log</string>
+</dict>
+</plist>

@@ -93,6 +93,16 @@ function buildVolumeMounts(
       containerPath: '/workspace/group',
       readonly: false,
     });
+
+    // Global memory directory (read-write, shadows the read-only project root)
+    const globalDir = path.join(GROUPS_DIR, 'global');
+    if (fs.existsSync(globalDir)) {
+      mounts.push({
+        hostPath: globalDir,
+        containerPath: '/workspace/global',
+        readonly: false,
+      });
+    }
   } else {
     // Other groups only get their own folder
     mounts.push({
@@ -101,14 +111,14 @@ function buildVolumeMounts(
       readonly: false,
     });
 
-    // Global memory directory (read-only for non-main)
+    // Global memory directory (read-write so agents can update CLAUDE.md)
     // Only directory mounts are supported, not file mounts
     const globalDir = path.join(GROUPS_DIR, 'global');
     if (fs.existsSync(globalDir)) {
       mounts.push({
         hostPath: globalDir,
         containerPath: '/workspace/global',
-        readonly: true,
+        readonly: false,
       });
     }
   }
@@ -198,6 +208,20 @@ function buildVolumeMounts(
     containerPath: '/app/src',
     readonly: false,
   });
+
+  // Mount second-brain jobs.json so agent can read active job
+  const secondBrainJobsFile = path.resolve(projectRoot, '..', 'jobs.json');
+  if (fs.existsSync(secondBrainJobsFile)) {
+    const sbDir = path.resolve(projectRoot, '..');
+    // Mount the whole second-brain dir so jobs.json path resolves
+    fs.mkdirSync('/tmp/second-brain-mount', { recursive: true });
+    fs.copyFileSync(secondBrainJobsFile, '/tmp/second-brain-mount/jobs.json');
+    mounts.push({
+      hostPath: '/tmp/second-brain-mount',
+      containerPath: '/workspace/second-brain',
+      readonly: true,
+    });
+  }
 
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {

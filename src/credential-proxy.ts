@@ -32,6 +32,8 @@ export function startCredentialProxy(
     'CLAUDE_CODE_OAUTH_TOKEN',
     'ANTHROPIC_AUTH_TOKEN',
     'ANTHROPIC_BASE_URL',
+    'OBSIDIAN_PERSONAL_VAULT_API_KEY',
+    'OPENAI_API_KEY',
   ]);
 
   const authMode: AuthMode = secrets.ANTHROPIC_API_KEY ? 'api-key' : 'oauth';
@@ -50,6 +52,102 @@ export function startCredentialProxy(
       req.on('data', (c) => chunks.push(c));
       req.on('end', () => {
         const body = Buffer.concat(chunks);
+
+        // ── Obsidian Local REST API proxy ──
+        // Routes /obsidian/* to the local Obsidian REST API, injecting the
+        // Bearer token so the container never sees the API key.
+        if (req.url?.startsWith('/obsidian/')) {
+          const obsidianPath = req.url.slice('/obsidian'.length); // keeps leading /
+          const obsidianHeaders: Record<string, string | number> = {
+            'content-type':
+              (req.headers['content-type'] as string) || 'text/markdown',
+            'content-length': body.length,
+          };
+          if (secrets.OBSIDIAN_PERSONAL_VAULT_API_KEY) {
+            obsidianHeaders['authorization'] =
+              `Bearer ${secrets.OBSIDIAN_PERSONAL_VAULT_API_KEY}`;
+          }
+
+          const obsidianReq = httpsRequest(
+            {
+              hostname: '127.0.0.1',
+              port: 27124,
+              path: obsidianPath,
+              method: req.method,
+              headers: obsidianHeaders,
+              rejectUnauthorized: false, // self-signed cert
+            },
+            (upRes) => {
+              res.writeHead(upRes.statusCode!, upRes.headers);
+              upRes.pipe(res);
+            },
+          );
+
+          obsidianReq.on('error', (err) => {
+            logger.error(
+              { err, url: req.url },
+              'Obsidian proxy upstream error',
+            );
+            if (!res.headersSent) {
+              res.writeHead(502);
+              res.end('Obsidian unavailable');
+            }
+          });
+
+          obsidianReq.write(body);
+          obsidianReq.end();
+          return;
+        }
+
+        // ── OpenAI API proxy ──
+        // Routes /openai/* to the OpenAI API, injecting the Bearer token
+        // so the container never sees the API key.
+        if (req.url?.startsWith('/openai/')) {
+          const openaiPath = req.url.slice('/openai'.length); // keeps leading /
+          const openaiHeaders: Record<string, string | number | string[]> = {
+            ...(req.headers as Record<string, string>),
+            host: 'api.openai.com',
+            'content-length': body.length,
+          };
+          delete openaiHeaders['connection'];
+          delete openaiHeaders['keep-alive'];
+          delete openaiHeaders['transfer-encoding'];
+
+          if (secrets.OPENAI_API_KEY) {
+            openaiHeaders['authorization'] =
+              `Bearer ${secrets.OPENAI_API_KEY}`;
+          }
+
+          const openaiReq = httpsRequest(
+            {
+              hostname: 'api.openai.com',
+              port: 443,
+              path: openaiPath,
+              method: req.method,
+              headers: openaiHeaders,
+            },
+            (upRes) => {
+              res.writeHead(upRes.statusCode!, upRes.headers);
+              upRes.pipe(res);
+            },
+          );
+
+          openaiReq.on('error', (err) => {
+            logger.error(
+              { err, url: req.url },
+              'OpenAI proxy upstream error',
+            );
+            if (!res.headersSent) {
+              res.writeHead(502);
+              res.end('OpenAI unavailable');
+            }
+          });
+
+          openaiReq.write(body);
+          openaiReq.end();
+          return;
+        }
+
         const headers: Record<string, string | number | string[] | undefined> =
           {
             ...(req.headers as Record<string, string>),

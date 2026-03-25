@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nanoclaw.telegram-bridge</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/opt/node@22/bin/npx</string>
+        <string>tsx</string>
+        <string>/Users/acarnes/second-brain/nanoclaw/telegram-bridge/index.ts</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/acarnes/second-brain/nanoclaw/telegram-bridge</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/acarnes/second-brain/nanoclaw/logs/telegram-bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/acarnes/second-brain/nanoclaw/logs/telegram-bridge-error.log</string>
+</dict>
+</plist>

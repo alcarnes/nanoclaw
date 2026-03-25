@@ -1,0 +1,18 @@
+{
+  "name": "nanoclaw-telegram-bridge",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "auth": "tsx auth.ts",
+    "start": "tsx index.ts",
+    "dev": "tsx --watch index.ts"
+  },
+  "dependencies": {
+    "telegram": "^2.26.16",
+    "input": "^1.0.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "@types/node": "^22.0.0"
+  }
+}

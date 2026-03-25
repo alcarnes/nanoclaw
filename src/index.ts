@@ -46,6 +46,7 @@ import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
+import { generateTTS } from './tts.js';
 import {
   restoreRemoteControl,
   startRemoteControl,
@@ -182,6 +183,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const prompt = formatMessages(missedMessages, TIMEZONE);
 
+  // Track whether the most recent user input was a voice message.
+  // This is mutable so piped follow-up messages can update it.
+  let lastInputWasVoice = missedMessages.some(
+    (m) => m.content.startsWith('[Voice transcript:') || m.content.startsWith('[Voice:'),
+  );
+
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
   const previousCursor = lastAgentTimestamp[chatJid] || '';
@@ -225,6 +232,21 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (text) {
         await channel.sendMessage(chatJid, text);
         outputSentToUser = true;
+
+        // Generate TTS for voice transcript responses (non-fatal)
+        if (lastInputWasVoice && channel.sendVoice) {
+          try {
+            const groupDir = resolveGroupFolderPath(group.folder);
+            const ttsPath = await generateTTS(text, path.join(groupDir, 'attachments'));
+            if (ttsPath) {
+              await channel.sendVoice(chatJid, ttsPath);
+            }
+          } catch (err) {
+            logger.warn({ err }, 'TTS failed (non-fatal)');
+          }
+          // Reset after responding — next piped message starts fresh
+          lastInputWasVoice = false;
+        }
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();

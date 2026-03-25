@@ -16,11 +16,14 @@ groups/*
 groups/main/*
 groups/global/*
 !groups/main/CLAUDE.md
-!groups/global/CLAUDE.md
+!groups/global/CLAUDE.md.example
 
 # Secrets
 *.keys.json
 .env
+.env.swp
+env.bak
+telegram-bridge/session.json
 
 # Temp files
 .tmp-*
