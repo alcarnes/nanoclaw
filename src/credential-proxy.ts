@@ -17,6 +17,13 @@ import { request as httpRequest, RequestOptions } from 'http';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 
+// Timeout for upstream API requests (ms). Prevents hanging sockets from
+// exhausting file descriptors when an upstream becomes unresponsive.
+const UPSTREAM_TIMEOUT = 30_000; // 30 seconds
+
+// Maximum request body size (bytes). Prevents unbounded memory allocation.
+const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB
+
 export type AuthMode = 'api-key' | 'oauth';
 
 export interface ProxyConfig {
@@ -48,9 +55,27 @@ export function startCredentialProxy(
 
   return new Promise((resolve, reject) => {
     const server = createServer((req, res) => {
+      // ── Health check endpoint ──
+      if (req.url === '/health') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ status: 'ok', authMode }));
+        return;
+      }
+
+      let bodySize = 0;
       const chunks: Buffer[] = [];
-      req.on('data', (c) => chunks.push(c));
+      req.on('data', (c: Buffer) => {
+        bodySize += c.length;
+        if (bodySize > MAX_BODY_SIZE) {
+          res.writeHead(413);
+          res.end('Request body too large');
+          req.destroy();
+          return;
+        }
+        chunks.push(c);
+      });
       req.on('end', () => {
+        if (bodySize > MAX_BODY_SIZE) return; // already responded
         const body = Buffer.concat(chunks);
 
         // ── Obsidian Local REST API proxy ──
@@ -76,12 +101,22 @@ export function startCredentialProxy(
               method: req.method,
               headers: obsidianHeaders,
               rejectUnauthorized: false, // self-signed cert
+              timeout: UPSTREAM_TIMEOUT,
             },
             (upRes) => {
               res.writeHead(upRes.statusCode!, upRes.headers);
               upRes.pipe(res);
             },
           );
+
+          obsidianReq.on('timeout', () => {
+            logger.error({ url: req.url }, 'Obsidian proxy upstream timeout');
+            obsidianReq.destroy();
+            if (!res.headersSent) {
+              res.writeHead(504);
+              res.end('Obsidian timeout');
+            }
+          });
 
           obsidianReq.on('error', (err) => {
             logger.error(
@@ -92,6 +127,10 @@ export function startCredentialProxy(
               res.writeHead(502);
               res.end('Obsidian unavailable');
             }
+          });
+
+          res.on('close', () => {
+            if (!obsidianReq.destroyed) obsidianReq.destroy();
           });
 
           obsidianReq.write(body);
@@ -114,8 +153,7 @@ export function startCredentialProxy(
           delete openaiHeaders['transfer-encoding'];
 
           if (secrets.OPENAI_API_KEY) {
-            openaiHeaders['authorization'] =
-              `Bearer ${secrets.OPENAI_API_KEY}`;
+            openaiHeaders['authorization'] = `Bearer ${secrets.OPENAI_API_KEY}`;
           }
 
           const openaiReq = httpsRequest(
@@ -125,6 +163,7 @@ export function startCredentialProxy(
               path: openaiPath,
               method: req.method,
               headers: openaiHeaders,
+              timeout: UPSTREAM_TIMEOUT,
             },
             (upRes) => {
               res.writeHead(upRes.statusCode!, upRes.headers);
@@ -132,15 +171,25 @@ export function startCredentialProxy(
             },
           );
 
+          openaiReq.on('timeout', () => {
+            logger.error({ url: req.url }, 'OpenAI proxy upstream timeout');
+            openaiReq.destroy();
+            if (!res.headersSent) {
+              res.writeHead(504);
+              res.end('OpenAI timeout');
+            }
+          });
+
           openaiReq.on('error', (err) => {
-            logger.error(
-              { err, url: req.url },
-              'OpenAI proxy upstream error',
-            );
+            logger.error({ err, url: req.url }, 'OpenAI proxy upstream error');
             if (!res.headersSent) {
               res.writeHead(502);
               res.end('OpenAI unavailable');
             }
+          });
+
+          res.on('close', () => {
+            if (!openaiReq.destroyed) openaiReq.destroy();
           });
 
           openaiReq.write(body);
@@ -184,12 +233,22 @@ export function startCredentialProxy(
             path: req.url,
             method: req.method,
             headers,
+            timeout: UPSTREAM_TIMEOUT,
           } as RequestOptions,
           (upRes) => {
             res.writeHead(upRes.statusCode!, upRes.headers);
             upRes.pipe(res);
           },
         );
+
+        upstream.on('timeout', () => {
+          logger.error({ url: req.url }, 'Credential proxy upstream timeout');
+          upstream.destroy();
+          if (!res.headersSent) {
+            res.writeHead(504);
+            res.end('Gateway Timeout');
+          }
+        });
 
         upstream.on('error', (err) => {
           logger.error(
@@ -200,6 +259,10 @@ export function startCredentialProxy(
             res.writeHead(502);
             res.end('Bad Gateway');
           }
+        });
+
+        res.on('close', () => {
+          if (!upstream.destroyed) upstream.destroy();
         });
 
         upstream.write(body);
