@@ -29,12 +29,16 @@ async function transcribeAudioFile(filePath: string): Promise<string | null> {
     const boundary = `----nanoclaw-${Date.now()}`;
     const parts: Buffer[] = [];
 
-    parts.push(Buffer.from(
-      `--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-1\r\n`
-    ));
-    parts.push(Buffer.from(
-      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`
-    ));
+    parts.push(
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-1\r\n`,
+      ),
+    );
+    parts.push(
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+      ),
+    );
     parts.push(audioBuffer);
     parts.push(Buffer.from('\r\n'));
     parts.push(Buffer.from(`--${boundary}--\r\n`));
@@ -44,7 +48,7 @@ async function transcribeAudioFile(filePath: string): Promise<string | null> {
     const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${secrets.OPENAI_API_KEY}`,
+        Authorization: `Bearer ${secrets.OPENAI_API_KEY}`,
         'Content-Type': `multipart/form-data; boundary=${boundary}`,
       },
       body,
@@ -52,11 +56,14 @@ async function transcribeAudioFile(filePath: string): Promise<string | null> {
 
     if (!res.ok) {
       const errText = await res.text();
-      logger.error({ status: res.status, errText }, 'Whisper transcription failed');
+      logger.error(
+        { status: res.status, errText },
+        'Whisper transcription failed',
+      );
       return null;
     }
 
-    const data = await res.json() as { text: string };
+    const data = (await res.json()) as { text: string };
     return data.text;
   } catch (err) {
     logger.error({ err }, 'Whisper transcription error');
@@ -76,7 +83,10 @@ async function downloadTelegramFile(
 
     // Telegram file size check
     if (file.file_size && file.file_size > MAX_DOWNLOAD_SIZE) {
-      logger.warn({ fileId, size: file.file_size }, 'Telegram file too large, skipping');
+      logger.warn(
+        { fileId, size: file.file_size },
+        'Telegram file too large, skipping',
+      );
       return null;
     }
 
@@ -131,12 +141,21 @@ async function sendTelegramMessage(
   }
 }
 
+// How often to check the polling connection health (ms)
+const HEALTH_CHECK_INTERVAL = 60_000; // 1 minute
+// If no updates received for this many consecutive checks, reconnect
+const MAX_SILENT_CHECKS = 5; // ~5 minutes with no activity triggers reconnect
+
 export class TelegramChannel implements Channel {
   name = 'telegram';
 
   private bot: Bot | null = null;
   private opts: TelegramChannelOpts;
   private botToken: string;
+  private healthTimer: ReturnType<typeof setInterval> | null = null;
+  private lastUpdateTime = Date.now();
+  private silentChecks = 0;
+  private reconnecting = false;
 
   constructor(botToken: string, opts: TelegramChannelOpts) {
     this.botToken = botToken;
@@ -175,6 +194,8 @@ export class TelegramChannel implements Channel {
     const TELEGRAM_BOT_COMMANDS = new Set(['chatid', 'ping']);
 
     this.bot.on('message:text', async (ctx) => {
+      this.lastUpdateTime = Date.now();
+
       if (ctx.message.text.startsWith('/')) {
         const cmd = ctx.message.text.slice(1).split(/[\s@]/)[0].toLowerCase();
         if (TELEGRAM_BOT_COMMANDS.has(cmd)) return;
@@ -257,6 +278,7 @@ export class TelegramChannel implements Channel {
 
     // Handle non-text messages — download files when possible
     const storeNonText = (ctx: any, placeholder: string) => {
+      this.lastUpdateTime = Date.now();
       const chatJid = `tg:${ctx.chat.id}`;
       const group = this.opts.registeredGroups()[chatJid];
       if (!group) return;
@@ -290,6 +312,7 @@ export class TelegramChannel implements Channel {
     };
 
     this.bot.on('message:photo', async (ctx) => {
+      this.lastUpdateTime = Date.now();
       const chatJid = `tg:${ctx.chat.id}`;
       const group = this.opts.registeredGroups()[chatJid];
       if (!group) return;
@@ -298,16 +321,29 @@ export class TelegramChannel implements Channel {
       const photos = ctx.message.photo;
       const largest = photos[photos.length - 1];
       const localPath = await downloadTelegramFile(
-        this.bot!, largest.file_id, group.folder, 'photo.jpg',
+        this.bot!,
+        largest.file_id,
+        group.folder,
+        'photo.jpg',
       );
 
       const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
-      const content = localPath ? `[Image: ${localPath}]${caption}` : `[Photo]${caption}`;
+      const content = localPath
+        ? `[Image: ${localPath}]${caption}`
+        : `[Photo]${caption}`;
 
       const timestamp = new Date(ctx.message.date * 1000).toISOString();
-      const senderName = ctx.from?.first_name || ctx.from?.username || 'Unknown';
-      const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
-      this.opts.onChatMetadata(chatJid, timestamp, undefined, 'telegram', isGroup);
+      const senderName =
+        ctx.from?.first_name || ctx.from?.username || 'Unknown';
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
       this.opts.onMessage(chatJid, {
         id: ctx.message.message_id.toString(),
         chat_jid: chatJid,
@@ -321,6 +357,7 @@ export class TelegramChannel implements Channel {
     });
 
     this.bot.on('message:document', async (ctx) => {
+      this.lastUpdateTime = Date.now();
       const chatJid = `tg:${ctx.chat.id}`;
       const group = this.opts.registeredGroups()[chatJid];
       if (!group) return;
@@ -328,16 +365,29 @@ export class TelegramChannel implements Channel {
       const doc = ctx.message.document!;
       const name = doc.file_name || 'document';
       const localPath = await downloadTelegramFile(
-        this.bot!, doc.file_id, group.folder, name,
+        this.bot!,
+        doc.file_id,
+        group.folder,
+        name,
       );
 
       const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
-      const content = localPath ? `[File: ${localPath}]${caption}` : `[Document: ${name}]${caption}`;
+      const content = localPath
+        ? `[File: ${localPath}]${caption}`
+        : `[Document: ${name}]${caption}`;
 
       const timestamp = new Date(ctx.message.date * 1000).toISOString();
-      const senderName = ctx.from?.first_name || ctx.from?.username || 'Unknown';
-      const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
-      this.opts.onChatMetadata(chatJid, timestamp, undefined, 'telegram', isGroup);
+      const senderName =
+        ctx.from?.first_name || ctx.from?.username || 'Unknown';
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
       this.opts.onMessage(chatJid, {
         id: ctx.message.message_id.toString(),
         chat_jid: chatJid,
@@ -347,17 +397,24 @@ export class TelegramChannel implements Channel {
         timestamp,
         is_from_me: false,
       });
-      logger.info({ chatJid, hasFile: !!localPath }, 'Telegram document stored');
+      logger.info(
+        { chatJid, hasFile: !!localPath },
+        'Telegram document stored',
+      );
     });
 
     this.bot.on('message:voice', async (ctx) => {
+      this.lastUpdateTime = Date.now();
       const chatJid = `tg:${ctx.chat.id}`;
       const group = this.opts.registeredGroups()[chatJid];
       if (!group) return;
 
       const voice = ctx.message.voice!;
       const localPath = await downloadTelegramFile(
-        this.bot!, voice.file_id, group.folder, 'voice.ogg',
+        this.bot!,
+        voice.file_id,
+        group.folder,
+        'voice.ogg',
       );
 
       let content = localPath ? `[Voice: ${localPath}]` : '[Voice message]';
@@ -365,18 +422,33 @@ export class TelegramChannel implements Channel {
       // Transcribe voice message
       if (localPath) {
         const groupDir = resolveGroupFolderPath(group.folder);
-        const hostPath = path.join(groupDir, 'attachments', path.basename(localPath));
+        const hostPath = path.join(
+          groupDir,
+          'attachments',
+          path.basename(localPath),
+        );
         const transcript = await transcribeAudioFile(hostPath);
         if (transcript) {
           content = `[Voice transcript: "${transcript}"]`;
-          logger.info({ chatJid, transcriptLength: transcript.length }, 'Voice message transcribed');
+          logger.info(
+            { chatJid, transcriptLength: transcript.length },
+            'Voice message transcribed',
+          );
         }
       }
 
       const timestamp = new Date(ctx.message.date * 1000).toISOString();
-      const senderName = ctx.from?.first_name || ctx.from?.username || 'Unknown';
-      const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
-      this.opts.onChatMetadata(chatJid, timestamp, undefined, 'telegram', isGroup);
+      const senderName =
+        ctx.from?.first_name || ctx.from?.username || 'Unknown';
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
       this.opts.onMessage(chatJid, {
         id: ctx.message.message_id.toString(),
         chat_jid: chatJid,
@@ -390,6 +462,7 @@ export class TelegramChannel implements Channel {
     });
 
     this.bot.on('message:audio', async (ctx) => {
+      this.lastUpdateTime = Date.now();
       const chatJid = `tg:${ctx.chat.id}`;
       const group = this.opts.registeredGroups()[chatJid];
       if (!group) return;
@@ -397,15 +470,26 @@ export class TelegramChannel implements Channel {
       const audio = ctx.message.audio!;
       const name = audio.file_name || 'audio.mp3';
       const localPath = await downloadTelegramFile(
-        this.bot!, audio.file_id, group.folder, name,
+        this.bot!,
+        audio.file_id,
+        group.folder,
+        name,
       );
 
       const content = localPath ? `[Audio: ${localPath}]` : `[Audio: ${name}]`;
 
       const timestamp = new Date(ctx.message.date * 1000).toISOString();
-      const senderName = ctx.from?.first_name || ctx.from?.username || 'Unknown';
-      const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
-      this.opts.onChatMetadata(chatJid, timestamp, undefined, 'telegram', isGroup);
+      const senderName =
+        ctx.from?.first_name || ctx.from?.username || 'Unknown';
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
       this.opts.onMessage(chatJid, {
         id: ctx.message.message_id.toString(),
         chat_jid: chatJid,
@@ -443,10 +527,88 @@ export class TelegramChannel implements Channel {
           console.log(
             `  Send /chatid to the bot to get a chat's registration ID\n`,
           );
+          this.startHealthCheck();
           resolve();
         },
       });
     });
+  }
+
+  private startHealthCheck(): void {
+    this.stopHealthCheck();
+    this.silentChecks = 0;
+    this.lastUpdateTime = Date.now();
+
+    this.healthTimer = setInterval(async () => {
+      if (!this.bot || this.reconnecting) return;
+
+      // First, try a lightweight getMe call to verify the connection is alive
+      try {
+        await this.bot.api.getMe();
+        // API responded — connection is alive, reset counter
+        if (this.silentChecks > 0) {
+          logger.info('Telegram polling health check passed (API reachable)');
+        }
+        this.silentChecks = 0;
+      } catch (err) {
+        this.silentChecks++;
+        logger.warn(
+          {
+            silentChecks: this.silentChecks,
+            threshold: MAX_SILENT_CHECKS,
+            err,
+          },
+          'Telegram health check failed (API unreachable)',
+        );
+
+        if (this.silentChecks >= MAX_SILENT_CHECKS) {
+          logger.error('Telegram polling appears dead — forcing reconnect');
+          this.reconnect();
+        }
+      }
+    }, HEALTH_CHECK_INTERVAL);
+  }
+
+  private stopHealthCheck(): void {
+    if (this.healthTimer) {
+      clearInterval(this.healthTimer);
+      this.healthTimer = null;
+    }
+  }
+
+  private async reconnect(): Promise<void> {
+    if (this.reconnecting) return;
+    this.reconnecting = true;
+    this.stopHealthCheck();
+
+    try {
+      if (this.bot) {
+        this.bot.stop();
+        this.bot = null;
+      }
+
+      logger.info('Telegram reconnecting...');
+      await this.connect();
+      logger.info('Telegram reconnected successfully');
+
+      // Notify registered Telegram groups about the recovery
+      for (const [jid] of Object.entries(this.opts.registeredGroups())) {
+        if (this.ownsJid(jid)) {
+          this.sendMessage(
+            jid,
+            `⚠️ ${ASSISTANT_NAME} Telegram connection was lost and has been restored. Messages sent during the outage may have been missed.`,
+          ).catch(() => {});
+        }
+      }
+    } catch (err) {
+      logger.error(
+        { err },
+        'Telegram reconnect failed — will retry next health check',
+      );
+      this.startHealthCheck();
+    } finally {
+      this.reconnecting = false;
+    }
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
@@ -478,7 +640,7 @@ export class TelegramChannel implements Channel {
   }
 
   isConnected(): boolean {
-    return this.bot !== null;
+    return this.bot !== null && !this.reconnecting;
   }
 
   ownsJid(jid: string): boolean {
@@ -486,6 +648,7 @@ export class TelegramChannel implements Channel {
   }
 
   async disconnect(): Promise<void> {
+    this.stopHealthCheck();
     if (this.bot) {
       this.bot.stop();
       this.bot = null;
@@ -508,7 +671,10 @@ export class TelegramChannel implements Channel {
     try {
       const numericId = jid.replace(/^tg:/, '');
       const audioData = fs.readFileSync(filePath);
-      await this.bot.api.sendVoice(numericId, new InputFile(audioData, path.basename(filePath)));
+      await this.bot.api.sendVoice(
+        numericId,
+        new InputFile(audioData, path.basename(filePath)),
+      );
       logger.info({ jid }, 'Telegram voice message sent');
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Telegram voice message');

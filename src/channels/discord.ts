@@ -35,12 +35,16 @@ async function transcribeAudioFile(filePath: string): Promise<string | null> {
     const boundary = `----nanoclaw-${Date.now()}`;
     const parts: Buffer[] = [];
 
-    parts.push(Buffer.from(
-      `--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-1\r\n`
-    ));
-    parts.push(Buffer.from(
-      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`
-    ));
+    parts.push(
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-1\r\n`,
+      ),
+    );
+    parts.push(
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+      ),
+    );
     parts.push(audioBuffer);
     parts.push(Buffer.from('\r\n'));
     parts.push(Buffer.from(`--${boundary}--\r\n`));
@@ -50,7 +54,7 @@ async function transcribeAudioFile(filePath: string): Promise<string | null> {
     const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${secrets.OPENAI_API_KEY}`,
+        Authorization: `Bearer ${secrets.OPENAI_API_KEY}`,
         'Content-Type': `multipart/form-data; boundary=${boundary}`,
       },
       body,
@@ -58,11 +62,14 @@ async function transcribeAudioFile(filePath: string): Promise<string | null> {
 
     if (!res.ok) {
       const errText = await res.text();
-      logger.error({ status: res.status, errText }, 'Whisper transcription failed');
+      logger.error(
+        { status: res.status, errText },
+        'Whisper transcription failed',
+      );
       return null;
     }
 
-    const data = await res.json() as { text: string };
+    const data = (await res.json()) as { text: string };
     return data.text;
   } catch (err) {
     logger.error({ err }, 'Whisper transcription error');
@@ -79,15 +86,24 @@ async function downloadAttachment(
     const res = await fetch(url);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
-    const contentLength = parseInt(res.headers.get('content-length') || '0', 10);
+    const contentLength = parseInt(
+      res.headers.get('content-length') || '0',
+      10,
+    );
     if (contentLength > MAX_DOWNLOAD_SIZE) {
-      logger.warn({ url, size: contentLength }, 'Attachment too large, skipping download');
+      logger.warn(
+        { url, size: contentLength },
+        'Attachment too large, skipping download',
+      );
       return null;
     }
 
     const buffer = Buffer.from(await res.arrayBuffer());
     if (buffer.length > MAX_DOWNLOAD_SIZE) {
-      logger.warn({ url, size: buffer.length }, 'Attachment too large after download');
+      logger.warn(
+        { url, size: buffer.length },
+        'Attachment too large after download',
+      );
       return null;
     }
 
@@ -113,6 +129,11 @@ export interface DiscordChannelOpts {
   registeredGroups: () => Record<string, RegisteredGroup>;
 }
 
+// How often to check the gateway connection health (ms)
+const HEALTH_CHECK_INTERVAL = 60_000; // 1 minute
+// If ws.ping is -1 (no ACK) for this many consecutive checks, reconnect
+const MAX_MISSED_PINGS = 3;
+
 export class DiscordChannel implements Channel {
   name = 'discord';
 
@@ -120,6 +141,9 @@ export class DiscordChannel implements Channel {
   private opts: DiscordChannelOpts;
   private botToken: string;
   private inputBotId: string | null = null;
+  private healthTimer: ReturnType<typeof setInterval> | null = null;
+  private missedPings = 0;
+  private reconnecting = false;
 
   constructor(botToken: string, opts: DiscordChannelOpts) {
     this.botToken = botToken;
@@ -138,18 +162,30 @@ export class DiscordChannel implements Channel {
 
     // Resolve the Aaron input bot ID if configured
     const envVars = readEnvFile(['AARON_INPUT_DISCORD_TOKEN']);
-    const inputBotToken = process.env.AARON_INPUT_DISCORD_TOKEN || envVars.AARON_INPUT_DISCORD_TOKEN || '';
+    const inputBotToken =
+      process.env.AARON_INPUT_DISCORD_TOKEN ||
+      envVars.AARON_INPUT_DISCORD_TOKEN ||
+      '';
     if (inputBotToken) {
       try {
         const res = await fetch('https://discord.com/api/v10/users/@me', {
           headers: { Authorization: `Bot ${inputBotToken}` },
         });
         if (res.ok) {
-          const botUser = await res.json() as { id: string; username: string };
+          const botUser = (await res.json()) as {
+            id: string;
+            username: string;
+          };
           this.inputBotId = botUser.id;
-          logger.info({ inputBotId: this.inputBotId, username: botUser.username }, 'Aaron input bot registered');
+          logger.info(
+            { inputBotId: this.inputBotId, username: botUser.username },
+            'Aaron input bot registered',
+          );
         } else {
-          logger.warn({ status: res.status }, 'Failed to fetch input bot user ID');
+          logger.warn(
+            { status: res.status },
+            'Failed to fetch input bot user ID',
+          );
         }
       } catch (err) {
         logger.warn({ err }, 'Failed to resolve input bot user ID');
@@ -158,7 +194,8 @@ export class DiscordChannel implements Channel {
 
     this.client.on(Events.MessageCreate, async (message: Message) => {
       // Ignore bot messages — except the Aaron input bot
-      const isInputBot = this.inputBotId && message.author.id === this.inputBotId;
+      const isInputBot =
+        this.inputBotId && message.author.id === this.inputBotId;
       if (message.author.bot && !isInputBot) return;
 
       const channelId = message.channelId;
@@ -227,18 +264,31 @@ export class DiscordChannel implements Channel {
 
           // Download images, audio, and documents
           if (group) {
-            const localPath = await downloadAttachment(att.url, group.folder, name);
+            const localPath = await downloadAttachment(
+              att.url,
+              group.folder,
+              name,
+            );
             if (localPath) {
               if (contentType.startsWith('image/')) {
                 attachmentDescriptions.push(`[Image: ${localPath}]`);
               } else if (contentType.startsWith('audio/')) {
                 // Transcribe audio files
                 const groupDir = resolveGroupFolderPath(group.folder);
-                const hostPath = path.join(groupDir, 'attachments', path.basename(localPath));
+                const hostPath = path.join(
+                  groupDir,
+                  'attachments',
+                  path.basename(localPath),
+                );
                 const transcript = await transcribeAudioFile(hostPath);
                 if (transcript) {
-                  attachmentDescriptions.push(`[Voice transcript: "${transcript}"]`);
-                  logger.info({ name, transcriptLength: transcript.length }, 'Audio transcribed');
+                  attachmentDescriptions.push(
+                    `[Voice transcript: "${transcript}"]`,
+                  );
+                  logger.info(
+                    { name, transcriptLength: transcript.length },
+                    'Audio transcribed',
+                  );
                 } else {
                   attachmentDescriptions.push(`[Audio: ${localPath}]`);
                 }
@@ -334,11 +384,84 @@ export class DiscordChannel implements Channel {
         console.log(
           `  Use /chatid command or check channel IDs in Discord settings\n`,
         );
+        this.startHealthCheck();
         resolve();
       });
 
       this.client!.login(this.botToken);
     });
+  }
+
+  private startHealthCheck(): void {
+    this.stopHealthCheck();
+    this.missedPings = 0;
+
+    this.healthTimer = setInterval(() => {
+      if (!this.client || this.reconnecting) return;
+
+      const ping = this.client.ws.ping;
+
+      if (ping === -1) {
+        this.missedPings++;
+        logger.warn(
+          { missedPings: this.missedPings, threshold: MAX_MISSED_PINGS },
+          'Discord gateway ping missed (no heartbeat ACK)',
+        );
+
+        if (this.missedPings >= MAX_MISSED_PINGS) {
+          logger.error('Discord gateway appears dead — forcing reconnect');
+          this.reconnect();
+        }
+      } else {
+        if (this.missedPings > 0) {
+          logger.info({ ping }, 'Discord gateway heartbeat recovered');
+        }
+        this.missedPings = 0;
+      }
+    }, HEALTH_CHECK_INTERVAL);
+  }
+
+  private stopHealthCheck(): void {
+    if (this.healthTimer) {
+      clearInterval(this.healthTimer);
+      this.healthTimer = null;
+    }
+  }
+
+  private async reconnect(): Promise<void> {
+    if (this.reconnecting) return;
+    this.reconnecting = true;
+    this.stopHealthCheck();
+
+    try {
+      if (this.client) {
+        this.client.destroy();
+        this.client = null;
+      }
+
+      logger.info('Discord reconnecting...');
+      await this.connect();
+      logger.info('Discord reconnected successfully');
+
+      // Notify registered Discord groups about the recovery
+      for (const [jid] of Object.entries(this.opts.registeredGroups())) {
+        if (this.ownsJid(jid)) {
+          this.sendMessage(
+            jid,
+            `⚠️ ${ASSISTANT_NAME} Discord connection was lost and has been restored. Messages sent during the outage may have been missed.`,
+          ).catch(() => {});
+        }
+      }
+    } catch (err) {
+      logger.error(
+        { err },
+        'Discord reconnect failed — will retry next health check',
+      );
+      // Restart the health check so it tries again
+      this.startHealthCheck();
+    } finally {
+      this.reconnecting = false;
+    }
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
@@ -382,6 +505,7 @@ export class DiscordChannel implements Channel {
   }
 
   async disconnect(): Promise<void> {
+    this.stopHealthCheck();
     if (this.client) {
       this.client.destroy();
       this.client = null;
