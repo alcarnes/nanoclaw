@@ -109,7 +109,9 @@ function createSchema(database: Database.Database): void {
         DROP TABLE registered_groups;
         ALTER TABLE registered_groups_new RENAME TO registered_groups;
       `);
-      logger.info('Migrated registered_groups: dropped UNIQUE constraint on folder');
+      logger.info(
+        'Migrated registered_groups: dropped UNIQUE constraint on folder',
+      );
     }
 
     // Add context_mode column if it doesn't exist
@@ -183,7 +185,9 @@ export function initDatabase(): void {
   db.pragma('foreign_keys = ON');
 
   // Integrity check on startup — detect corruption early
-  const integrity = db.pragma('integrity_check') as { integrity_check: string }[];
+  const integrity = db.pragma('integrity_check') as {
+    integrity_check: string;
+  }[];
   if (integrity.length !== 1 || integrity[0].integrity_check !== 'ok') {
     const issues = integrity.map((r) => r.integrity_check).join(', ');
     logger.error({ issues }, 'SQLite integrity check failed');

@@ -657,8 +657,12 @@ async function main(): Promise<void> {
 
     // 1. Broadcast shutdown notice while channels are still connected
     try {
-      await broadcastStatus(`⚙️ ${ASSISTANT_NAME} is restarting — back shortly.`);
-    } catch { /* best-effort */ }
+      await broadcastStatus(
+        `⚙️ ${ASSISTANT_NAME} is restarting — back shortly.`,
+      );
+    } catch {
+      /* best-effort */
+    }
 
     // 2. Stop subsystem loops so they don't enqueue new work
     stopMessageLoop();
@@ -784,7 +788,15 @@ async function main(): Promise<void> {
       Promise.race([
         channel.connect().then(() => ({ name, channel })),
         new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(`${name} connect timed out after ${CHANNEL_CONNECT_TIMEOUT / 1000}s`)), CHANNEL_CONNECT_TIMEOUT),
+          setTimeout(
+            () =>
+              reject(
+                new Error(
+                  `${name} connect timed out after ${CHANNEL_CONNECT_TIMEOUT / 1000}s`,
+                ),
+              ),
+            CHANNEL_CONNECT_TIMEOUT,
+          ),
         ),
       ]),
     ),

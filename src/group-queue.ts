@@ -240,7 +240,11 @@ export class GroupQueue {
         const activeJid = this.activeFolders.get(folder);
         if (activeJid && activeJid !== groupJid) {
           const sibState = this.getGroup(activeJid);
-          if (sibState.active && sibState.groupFolder && !sibState.isTaskContainer) {
+          if (
+            sibState.active &&
+            sibState.groupFolder &&
+            !sibState.isTaskContainer
+          ) {
             state = sibState;
             targetFolder = sibState.groupFolder;
           }
