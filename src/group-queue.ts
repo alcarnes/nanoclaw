@@ -24,6 +24,7 @@ interface GroupState {
   process: ChildProcess | null;
   containerName: string | null;
   groupFolder: string | null;
+  responseJid: string | null; // JID that most recently piped a message (for response routing)
   retryCount: number;
 }
 
@@ -34,6 +35,11 @@ export class GroupQueue {
   private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
     null;
   private shuttingDown = false;
+  // Folder-level locking: prevents two containers for the same shared folder
+  private activeFolders = new Map<string, string>(); // folder -> active JID
+  private jidFolders = new Map<string, string>(); // JID -> folder
+  // Groups that exceeded max retries — retried by periodic recovery sweep
+  private failedGroups = new Set<string>();
 
   private getGroup(groupJid: string): GroupState {
     let state = this.groups.get(groupJid);
@@ -48,6 +54,7 @@ export class GroupQueue {
         process: null,
         containerName: null,
         groupFolder: null,
+        responseJid: null,
         retryCount: 0,
       };
       this.groups.set(groupJid, state);
@@ -59,6 +66,29 @@ export class GroupQueue {
     this.processMessagesFn = fn;
   }
 
+  /** Register a JID's folder mapping for folder-level locking. */
+  setGroupFolder(jid: string, folder: string): void {
+    this.jidFolders.set(jid, folder);
+  }
+
+  /** Check if a JID's folder already has an active container (via a sibling JID). */
+  private isFolderActive(groupJid: string): string | undefined {
+    const folder = this.jidFolders.get(groupJid);
+    if (!folder) return undefined;
+    return this.activeFolders.get(folder);
+  }
+
+  /** Get all JIDs that share a folder with the given JID. */
+  private getSiblingJids(groupJid: string): string[] {
+    const folder = this.jidFolders.get(groupJid);
+    if (!folder) return [];
+    const siblings: string[] = [];
+    for (const [jid, f] of this.jidFolders) {
+      if (f === folder && jid !== groupJid) siblings.push(jid);
+    }
+    return siblings;
+  }
+
   enqueueMessageCheck(groupJid: string): void {
     if (this.shuttingDown) return;
 
@@ -67,6 +97,20 @@ export class GroupQueue {
     if (state.active) {
       state.pendingMessages = true;
       logger.debug({ groupJid }, 'Container active, message queued');
+      return;
+    }
+
+    // Check if a sibling JID's container is already running for this folder
+    const activeSibling = this.isFolderActive(groupJid);
+    if (activeSibling) {
+      state.pendingMessages = true;
+      if (!this.waitingGroups.includes(groupJid)) {
+        this.waitingGroups.push(groupJid);
+      }
+      logger.debug(
+        { groupJid, activeSibling },
+        'Sibling container active for shared folder, message queued',
+      );
       return;
     }
 
@@ -81,6 +125,10 @@ export class GroupQueue {
       );
       return;
     }
+
+    // Set folder lock synchronously before async start
+    const folder = this.jidFolders.get(groupJid);
+    if (folder) this.activeFolders.set(folder, groupJid);
 
     this.runForGroup(groupJid, 'messages').catch((err) =>
       logger.error({ groupJid, err }, 'Unhandled error in runForGroup'),
@@ -111,6 +159,20 @@ export class GroupQueue {
       return;
     }
 
+    // Check if a sibling JID's container is already running for this folder
+    const activeSibling = this.isFolderActive(groupJid);
+    if (activeSibling) {
+      state.pendingTasks.push({ id: taskId, groupJid, fn });
+      if (!this.waitingGroups.includes(groupJid)) {
+        this.waitingGroups.push(groupJid);
+      }
+      logger.debug(
+        { groupJid, taskId, activeSibling },
+        'Sibling container active for shared folder, task queued',
+      );
+      return;
+    }
+
     if (this.activeCount >= MAX_CONCURRENT_CONTAINERS) {
       state.pendingTasks.push({ id: taskId, groupJid, fn });
       if (!this.waitingGroups.includes(groupJid)) {
@@ -122,6 +184,10 @@ export class GroupQueue {
       );
       return;
     }
+
+    // Set folder lock synchronously before async start
+    const folder = this.jidFolders.get(groupJid);
+    if (folder) this.activeFolders.set(folder, groupJid);
 
     // Run immediately
     this.runTask(groupJid, { id: taskId, groupJid, fn }).catch((err) =>
@@ -157,13 +223,38 @@ export class GroupQueue {
    * Send a follow-up message to the active container via IPC file.
    * Returns true if the message was written, false if no active container.
    */
+  /**
+   * Send a follow-up message to the active container via IPC file.
+   * Supports cross-JID piping for shared folders.
+   * Returns true if the message was written, false if no active container.
+   */
   sendMessage(groupJid: string, text: string): boolean {
-    const state = this.getGroup(groupJid);
-    if (!state.active || !state.groupFolder || state.isTaskContainer)
-      return false;
-    state.idleWaiting = false; // Agent is about to receive work, no longer idle
+    let state = this.getGroup(groupJid);
+    let targetFolder = state.groupFolder;
 
-    const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
+    // Cross-JID piping: if this JID has no active container, check if a
+    // sibling JID (shared folder) has one and pipe to that instead.
+    if (!state.active || !targetFolder) {
+      const folder = this.jidFolders.get(groupJid);
+      if (folder) {
+        const activeJid = this.activeFolders.get(folder);
+        if (activeJid && activeJid !== groupJid) {
+          const sibState = this.getGroup(activeJid);
+          if (sibState.active && sibState.groupFolder && !sibState.isTaskContainer) {
+            state = sibState;
+            targetFolder = sibState.groupFolder;
+          }
+        }
+      }
+    }
+
+    if (!state.active || !targetFolder || state.isTaskContainer) return false;
+    state.idleWaiting = false;
+
+    // Track which JID most recently piped a message — used for response routing
+    state.responseJid = groupJid;
+
+    const inputDir = path.join(DATA_DIR, 'ipc', targetFolder, 'input');
     try {
       fs.mkdirSync(inputDir, { recursive: true });
       const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
@@ -175,6 +266,22 @@ export class GroupQueue {
     } catch {
       return false;
     }
+  }
+
+  /** Get the JID that most recently piped a message to this group's container. */
+  getResponseJid(groupJid: string): string | null {
+    const state = this.groups.get(groupJid);
+    if (state?.responseJid) return state.responseJid;
+    // Check siblings
+    const folder = this.jidFolders.get(groupJid);
+    if (folder) {
+      const activeJid = this.activeFolders.get(folder);
+      if (activeJid) {
+        const activeState = this.groups.get(activeJid);
+        if (activeState?.responseJid) return activeState.responseJid;
+      }
+    }
+    return null;
   }
 
   /**
@@ -204,6 +311,10 @@ export class GroupQueue {
     state.pendingMessages = false;
     this.activeCount++;
 
+    // Ensure folder lock is set (may already be set by enqueueMessageCheck)
+    const folder = this.jidFolders.get(groupJid);
+    if (folder) this.activeFolders.set(folder, groupJid);
+
     logger.debug(
       { groupJid, reason, activeCount: this.activeCount },
       'Starting container for group',
@@ -226,8 +337,13 @@ export class GroupQueue {
       state.process = null;
       state.containerName = null;
       state.groupFolder = null;
+      state.responseJid = null;
       this.activeCount--;
+      // Drain this JID and sibling JIDs before clearing the folder lock
       this.drainGroup(groupJid);
+      this.drainSiblings(groupJid);
+      const folder = this.jidFolders.get(groupJid);
+      if (folder) this.activeFolders.delete(folder);
     }
   }
 
@@ -238,6 +354,10 @@ export class GroupQueue {
     state.isTaskContainer = true;
     state.runningTaskId = task.id;
     this.activeCount++;
+
+    // Ensure folder lock is set
+    const folder = this.jidFolders.get(groupJid);
+    if (folder) this.activeFolders.set(folder, groupJid);
 
     logger.debug(
       { groupJid, taskId: task.id, activeCount: this.activeCount },
@@ -255,8 +375,13 @@ export class GroupQueue {
       state.process = null;
       state.containerName = null;
       state.groupFolder = null;
+      state.responseJid = null;
       this.activeCount--;
+      // Drain this JID and sibling JIDs before clearing the folder lock
       this.drainGroup(groupJid);
+      this.drainSiblings(groupJid);
+      const folder = this.jidFolders.get(groupJid);
+      if (folder) this.activeFolders.delete(folder);
     }
   }
 
@@ -265,9 +390,11 @@ export class GroupQueue {
     if (state.retryCount > MAX_RETRIES) {
       logger.error(
         { groupJid, retryCount: state.retryCount },
-        'Max retries exceeded, dropping messages (will retry on next incoming message)',
+        'Max retries exceeded — persisting for recovery sweep',
       );
       state.retryCount = 0;
+      // Persist the failed JID so the periodic recovery sweep can retry it
+      this.failedGroups.add(groupJid);
       return;
     }
 
@@ -315,6 +442,19 @@ export class GroupQueue {
     this.drainWaiting();
   }
 
+  /** Check if sibling JIDs (same folder) have pending work and drain them. */
+  private drainSiblings(groupJid: string): void {
+    for (const sibJid of this.getSiblingJids(groupJid)) {
+      const sibState = this.getGroup(sibJid);
+      if (sibState.pendingMessages || sibState.pendingTasks.length > 0) {
+        // Remove from waitingGroups if present (drainGroup will handle it)
+        const idx = this.waitingGroups.indexOf(sibJid);
+        if (idx !== -1) this.waitingGroups.splice(idx, 1);
+        this.drainGroup(sibJid);
+      }
+    }
+  }
+
   private drainWaiting(): void {
     while (
       this.waitingGroups.length > 0 &&
@@ -322,6 +462,19 @@ export class GroupQueue {
     ) {
       const nextJid = this.waitingGroups.shift()!;
       const state = this.getGroup(nextJid);
+
+      // Skip if a sibling's container is already running for the same folder
+      if (this.isFolderActive(nextJid)) {
+        // Re-queue so it gets picked up when the sibling finishes
+        if (!this.waitingGroups.includes(nextJid)) {
+          this.waitingGroups.push(nextJid);
+        }
+        continue;
+      }
+
+      // Set folder lock before starting
+      const folder = this.jidFolders.get(nextJid);
+      if (folder) this.activeFolders.set(folder, nextJid);
 
       // Prioritize tasks over messages
       if (state.pendingTasks.length > 0) {
@@ -339,8 +492,29 @@ export class GroupQueue {
             'Unhandled error in runForGroup (waiting)',
           ),
         );
+      } else {
+        // Nothing pending — release the folder lock
+        if (folder) this.activeFolders.delete(folder);
       }
-      // If neither pending, skip this group
+    }
+  }
+
+  /**
+   * Retry groups that previously exceeded max retries.
+   * Called periodically from the scheduler loop.
+   */
+  recoverFailedGroups(): void {
+    if (this.shuttingDown || this.failedGroups.size === 0) return;
+
+    const recovered = [...this.failedGroups];
+    this.failedGroups.clear();
+
+    for (const groupJid of recovered) {
+      const state = this.getGroup(groupJid);
+      if (state.pendingMessages || state.pendingTasks.length > 0) {
+        logger.info({ groupJid }, 'Recovery sweep: retrying failed group');
+        this.enqueueMessageCheck(groupJid);
+      }
     }
   }
 

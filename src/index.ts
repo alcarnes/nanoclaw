@@ -32,6 +32,7 @@ import {
   getAllSessions,
   getAllTasks,
   getMessagesSince,
+  getMessagesSinceForFolder,
   getNewMessages,
   getRegisteredGroup,
   getRouterState,
@@ -44,7 +45,7 @@ import {
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
-import { startIpcWatcher } from './ipc.js';
+import { startIpcWatcher, stopIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import { generateTTS } from './tts.js';
 import {
@@ -58,7 +59,7 @@ import {
   loadSenderAllowlist,
   shouldDropMessage,
 } from './sender-allowlist.js';
-import { startSchedulerLoop } from './task-scheduler.js';
+import { startSchedulerLoop, stopSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
@@ -85,6 +86,10 @@ function loadState(): void {
   }
   sessions = getAllSessions();
   registeredGroups = getAllRegisteredGroups();
+  // Populate queue's folder mapping for folder-level locking
+  for (const [jid, group] of Object.entries(registeredGroups)) {
+    queue.setGroupFolder(jid, group.folder);
+  }
   logger.info(
     { groupCount: Object.keys(registeredGroups).length },
     'State loaded',
@@ -94,6 +99,13 @@ function loadState(): void {
 function saveState(): void {
   setRouterState('last_timestamp', lastTimestamp);
   setRouterState('last_agent_timestamp', JSON.stringify(lastAgentTimestamp));
+}
+
+/** Get all JIDs that share a folder (from in-memory map, no DB query). */
+function getJidsForFolder(folder: string): string[] {
+  return Object.entries(registeredGroups)
+    .filter(([_, g]) => g.folder === folder)
+    .map(([jid]) => jid);
 }
 
 function registerGroup(jid: string, group: RegisteredGroup): void {
@@ -110,6 +122,7 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
 
   registeredGroups[jid] = group;
   setRegisteredGroup(jid, group);
+  queue.setGroupFolder(jid, group.folder);
 
   // Create group folder
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
@@ -161,12 +174,25 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const isMainGroup = group.isMain === true;
 
-  const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-  const missedMessages = getMessagesSince(
-    chatJid,
-    sinceTimestamp,
-    ASSISTANT_NAME,
-  );
+  // Shared folder support: fetch messages from all JIDs sharing this folder
+  const folderJids = getJidsForFolder(group.folder);
+  let missedMessages: NewMessage[];
+
+  if (folderJids.length > 1) {
+    // Compute earliest cursor across all sibling JIDs
+    const earliestTimestamp = folderJids.reduce((min, jid) => {
+      const ts = lastAgentTimestamp[jid] || '';
+      return ts < min ? ts : min;
+    }, lastAgentTimestamp[chatJid] || '');
+    missedMessages = getMessagesSinceForFolder(
+      folderJids,
+      earliestTimestamp,
+      ASSISTANT_NAME,
+    );
+  } else {
+    const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
+    missedMessages = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
+  }
 
   if (missedMessages.length === 0) return true;
 
@@ -186,14 +212,27 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // Track whether the most recent user input was a voice message.
   // This is mutable so piped follow-up messages can update it.
   let lastInputWasVoice = missedMessages.some(
-    (m) => m.content.startsWith('[Voice transcript:') || m.content.startsWith('[Voice:'),
+    (m) =>
+      m.content.startsWith('[Voice transcript:') ||
+      m.content.startsWith('[Voice:'),
   );
 
-  // Advance cursor so the piping path in startMessageLoop won't re-fetch
-  // these messages. Save the old cursor so we can roll back on error.
-  const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] =
-    missedMessages[missedMessages.length - 1].timestamp;
+  // Save previous cursors for ALL sibling JIDs so we can roll back on error.
+  const previousCursors: Record<string, string> = {};
+  for (const jid of folderJids) {
+    previousCursors[jid] = lastAgentTimestamp[jid] || '';
+  }
+
+  // Advance per-JID cursors only to each JID's own max timestamp
+  for (const jid of folderJids) {
+    const maxTs = missedMessages
+      .filter((m) => m.chat_jid === jid)
+      .reduce(
+        (max, m) => (m.timestamp > max ? m.timestamp : max),
+        lastAgentTimestamp[jid] || '',
+      );
+    if (maxTs) lastAgentTimestamp[jid] = maxTs;
+  }
   saveState();
 
   logger.info(
@@ -230,14 +269,21 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
-        await channel.sendMessage(chatJid, text);
+        // Route response to the JID that most recently sent a message
+        // (may differ from chatJid if a piped message came from another channel)
+        const responseJid = queue.getResponseJid(chatJid) || chatJid;
+        const responseChannel = findChannel(channels, responseJid) || channel;
+        await responseChannel.sendMessage(responseJid, text);
         outputSentToUser = true;
 
         // Generate TTS for voice transcript responses (non-fatal)
         if (lastInputWasVoice && channel.sendVoice) {
           try {
             const groupDir = resolveGroupFolderPath(group.folder);
-            const ttsPath = await generateTTS(text, path.join(groupDir, 'attachments'));
+            const ttsPath = await generateTTS(
+              text,
+              path.join(groupDir, 'attachments'),
+            );
             if (ttsPath) {
               await channel.sendVoice(chatJid, ttsPath);
             }
@@ -274,12 +320,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       );
       return true;
     }
-    // Roll back cursor so retries can re-process these messages
-    lastAgentTimestamp[chatJid] = previousCursor;
+    // Roll back cursors for ALL sibling JIDs so retries can re-process
+    for (const [jid, prev] of Object.entries(previousCursors)) {
+      lastAgentTimestamp[jid] = prev;
+    }
     saveState();
     logger.warn(
       { group: group.name },
-      'Agent error, rolled back message cursor for retry',
+      'Agent error, rolled back message cursors for retry',
     );
     return false;
   }
@@ -368,6 +416,11 @@ async function runAgent(
   }
 }
 
+function stopMessageLoop(): void {
+  messageLoopRunning = false;
+  logger.info('Message loop stopped');
+}
+
 async function startMessageLoop(): Promise<void> {
   if (messageLoopRunning) {
     logger.debug('Message loop already running, skipping duplicate start');
@@ -377,7 +430,7 @@ async function startMessageLoop(): Promise<void> {
 
   logger.info(`NanoClaw running (trigger: @${ASSISTANT_NAME})`);
 
-  while (true) {
+  while (messageLoopRunning) {
     try {
       const jids = Object.keys(registeredGroups);
       const { messages, newTimestamp } = getNewMessages(
@@ -393,72 +446,128 @@ async function startMessageLoop(): Promise<void> {
         lastTimestamp = newTimestamp;
         saveState();
 
-        // Deduplicate by group
-        const messagesByGroup = new Map<string, NewMessage[]>();
+        // Group messages by JID, then deduplicate by folder
+        const messagesByJid = new Map<string, NewMessage[]>();
         for (const msg of messages) {
-          const existing = messagesByGroup.get(msg.chat_jid);
+          const existing = messagesByJid.get(msg.chat_jid);
           if (existing) {
             existing.push(msg);
           } else {
-            messagesByGroup.set(msg.chat_jid, [msg]);
+            messagesByJid.set(msg.chat_jid, [msg]);
           }
         }
 
-        for (const [chatJid, groupMessages] of messagesByGroup) {
+        // Deduplicate by folder: merge sibling JIDs' messages
+        const processedFolders = new Set<string>();
+        for (const [chatJid, groupMessages] of messagesByJid) {
           const group = registeredGroups[chatJid];
           if (!group) continue;
 
-          const channel = findChannel(channels, chatJid);
-          if (!channel) {
-            logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
+          // Skip if we already processed this folder (shared folder dedup)
+          if (processedFolders.has(group.folder)) continue;
+          processedFolders.add(group.folder);
+
+          // Collect all JIDs and messages for this folder
+          const folderJids = getJidsForFolder(group.folder);
+          const allFolderMessages: NewMessage[] = [];
+          const contributingJids: string[] = [];
+          for (const jid of folderJids) {
+            const jidMsgs = messagesByJid.get(jid);
+            if (jidMsgs) {
+              allFolderMessages.push(...jidMsgs);
+              contributingJids.push(jid);
+            }
+          }
+
+          // Find a JID with a trigger (for trigger checking)
+          let triggerJid: string | undefined;
+          const allowlistCfg = loadSenderAllowlist();
+          for (const jid of contributingJids) {
+            const jidGroup = registeredGroups[jid];
+            if (!jidGroup) continue;
+            const isMainGroup = jidGroup.isMain === true;
+            const needsTrigger =
+              !isMainGroup && jidGroup.requiresTrigger !== false;
+            if (!needsTrigger) {
+              triggerJid = jid;
+              break;
+            }
+            const jidMsgs = messagesByJid.get(jid) || [];
+            const hasTrigger = jidMsgs.some(
+              (m) =>
+                TRIGGER_PATTERN.test(m.content.trim()) &&
+                (m.is_from_me || isTriggerAllowed(jid, m.sender, allowlistCfg)),
+            );
+            if (hasTrigger) {
+              triggerJid = jid;
+              break;
+            }
+          }
+
+          if (!triggerJid) continue; // No trigger found across any JID
+
+          const triggerChannel = findChannel(channels, triggerJid);
+          if (!triggerChannel) {
+            logger.warn(
+              { chatJid: triggerJid },
+              'No channel owns JID, skipping messages',
+            );
             continue;
           }
 
-          const isMainGroup = group.isMain === true;
-          const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
-
-          // For non-main groups, only act on trigger messages.
-          // Non-trigger messages accumulate in DB and get pulled as
-          // context when a trigger eventually arrives.
-          if (needsTrigger) {
-            const allowlistCfg = loadSenderAllowlist();
-            const hasTrigger = groupMessages.some(
-              (m) =>
-                TRIGGER_PATTERN.test(m.content.trim()) &&
-                (m.is_from_me ||
-                  isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
+          // Pull all messages since lastAgentTimestamp for the folder
+          let messagesToSend: NewMessage[];
+          if (folderJids.length > 1) {
+            const earliestTimestamp = folderJids.reduce((min, jid) => {
+              const ts = lastAgentTimestamp[jid] || '';
+              return ts < min ? ts : min;
+            }, lastAgentTimestamp[triggerJid] || '');
+            messagesToSend = getMessagesSinceForFolder(
+              folderJids,
+              earliestTimestamp,
+              ASSISTANT_NAME,
             );
-            if (!hasTrigger) continue;
+          } else {
+            const allPending = getMessagesSince(
+              triggerJid,
+              lastAgentTimestamp[triggerJid] || '',
+              ASSISTANT_NAME,
+            );
+            messagesToSend =
+              allPending.length > 0 ? allPending : allFolderMessages;
           }
 
-          // Pull all messages since lastAgentTimestamp so non-trigger
-          // context that accumulated between triggers is included.
-          const allPending = getMessagesSince(
-            chatJid,
-            lastAgentTimestamp[chatJid] || '',
-            ASSISTANT_NAME,
-          );
-          const messagesToSend =
-            allPending.length > 0 ? allPending : groupMessages;
           const formatted = formatMessages(messagesToSend, TIMEZONE);
 
-          if (queue.sendMessage(chatJid, formatted)) {
+          if (queue.sendMessage(triggerJid, formatted)) {
             logger.debug(
-              { chatJid, count: messagesToSend.length },
+              { chatJid: triggerJid, count: messagesToSend.length },
               'Piped messages to active container',
             );
-            lastAgentTimestamp[chatJid] =
-              messagesToSend[messagesToSend.length - 1].timestamp;
+            // Per-JID cursor advancement
+            for (const jid of folderJids) {
+              const maxTs = messagesToSend
+                .filter((m) => m.chat_jid === jid)
+                .reduce(
+                  (max, m) => (m.timestamp > max ? m.timestamp : max),
+                  lastAgentTimestamp[jid] || '',
+                );
+              if (maxTs) lastAgentTimestamp[jid] = maxTs;
+            }
             saveState();
-            // Show typing indicator while the container processes the piped message
-            channel
-              .setTyping?.(chatJid, true)
-              ?.catch((err) =>
-                logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
+            // Show typing indicator on each contributing JID's channel
+            for (const jid of contributingJids) {
+              const ch = findChannel(channels, jid);
+              ch?.setTyping?.(jid, true)?.catch((err) =>
+                logger.warn(
+                  { chatJid: jid, err },
+                  'Failed to set typing indicator',
+                ),
               );
+            }
           } else {
-            // No active container — enqueue for a new one
-            queue.enqueueMessageCheck(chatJid);
+            // No active container — enqueue the trigger JID for a new one
+            queue.enqueueMessageCheck(triggerJid);
           }
         }
       }
@@ -474,16 +583,36 @@ async function startMessageLoop(): Promise<void> {
  * Handles crash between advancing lastTimestamp and processing messages.
  */
 function recoverPendingMessages(): void {
+  const recoveredFolders = new Set<string>();
   for (const [chatJid, group] of Object.entries(registeredGroups)) {
-    const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-    const pending = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
-    if (pending.length > 0) {
+    if (recoveredFolders.has(group.folder)) continue;
+
+    const folderJids = getJidsForFolder(group.folder);
+    // Find which JID has the most recent pending message
+    let bestJid = chatJid;
+    let bestTs = '';
+    for (const jid of folderJids) {
+      const pending = getMessagesSince(
+        jid,
+        lastAgentTimestamp[jid] || '',
+        ASSISTANT_NAME,
+      );
+      if (
+        pending.length > 0 &&
+        pending[pending.length - 1].timestamp > bestTs
+      ) {
+        bestJid = jid;
+        bestTs = pending[pending.length - 1].timestamp;
+      }
+    }
+    if (bestTs) {
       logger.info(
-        { group: group.name, pendingCount: pending.length },
+        { group: group.name, bestJid },
         'Recovery: found unprocessed messages',
       );
-      queue.enqueueMessageCheck(chatJid);
+      queue.enqueueMessageCheck(bestJid);
     }
+    recoveredFolders.add(group.folder);
   }
 }
 
@@ -505,11 +634,44 @@ async function main(): Promise<void> {
     PROXY_BIND_HOST,
   );
 
+  // Broadcast a status message to all registered groups
+  const broadcastStatus = async (text: string) => {
+    for (const [jid] of Object.entries(registeredGroups)) {
+      const ch = findChannel(channels, jid);
+      if (ch) {
+        try {
+          await ch.sendMessage(jid, text);
+        } catch (err) {
+          logger.warn({ jid, err }, 'Failed to send status broadcast');
+        }
+      }
+    }
+  };
+
   // Graceful shutdown handlers
+  let shuttingDown = false;
   const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     logger.info({ signal }, 'Shutdown signal received');
-    proxyServer.close();
+
+    // 1. Broadcast shutdown notice while channels are still connected
+    try {
+      await broadcastStatus(`⚙️ ${ASSISTANT_NAME} is restarting — back shortly.`);
+    } catch { /* best-effort */ }
+
+    // 2. Stop subsystem loops so they don't enqueue new work
+    stopMessageLoop();
+    stopSchedulerLoop();
+    stopIpcWatcher();
+
+    // 3. Drain in-flight container work
     await queue.shutdown(10000);
+
+    // 4. Close credential proxy (no new API calls)
+    proxyServer.close();
+
+    // 5. Disconnect channels last
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
   };
@@ -598,9 +760,12 @@ async function main(): Promise<void> {
     registeredGroups: () => registeredGroups,
   };
 
-  // Create and connect all registered channels.
+  // Create and connect all registered channels in parallel with timeouts.
   // Each channel self-registers via the barrel import above.
   // Factories return null when credentials are missing, so unconfigured channels are skipped.
+  const CHANNEL_CONNECT_TIMEOUT = 30_000; // 30 seconds per channel
+
+  const pendingChannels: { name: string; channel: Channel }[] = [];
   for (const channelName of getRegisteredChannelNames()) {
     const factory = getChannelFactory(channelName)!;
     const channel = factory(channelOpts);
@@ -611,9 +776,28 @@ async function main(): Promise<void> {
       );
       continue;
     }
-    channels.push(channel);
-    await channel.connect();
+    pendingChannels.push({ name: channelName, channel });
   }
+
+  const connectResults = await Promise.allSettled(
+    pendingChannels.map(({ name, channel }) =>
+      Promise.race([
+        channel.connect().then(() => ({ name, channel })),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`${name} connect timed out after ${CHANNEL_CONNECT_TIMEOUT / 1000}s`)), CHANNEL_CONNECT_TIMEOUT),
+        ),
+      ]),
+    ),
+  );
+
+  for (const result of connectResults) {
+    if (result.status === 'fulfilled') {
+      channels.push(result.value.channel);
+    } else {
+      logger.error({ err: result.reason }, 'Channel failed to connect');
+    }
+  }
+
   if (channels.length === 0) {
     logger.fatal('No channels connected');
     process.exit(1);
@@ -661,6 +845,9 @@ async function main(): Promise<void> {
     logger.fatal({ err }, 'Message loop crashed unexpectedly');
     process.exit(1);
   });
+
+  // Notify all groups that the system is back online
+  broadcastStatus(`✅ ${ASSISTANT_NAME} is back online.`).catch(() => {});
 }
 
 // Guard: only run when executed directly, not when imported by tests

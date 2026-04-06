@@ -76,7 +76,7 @@ function createSchema(database: Database.Database): void {
     CREATE TABLE IF NOT EXISTS registered_groups (
       jid TEXT PRIMARY KEY,
       name TEXT NOT NULL,
-      folder TEXT NOT NULL UNIQUE,
+      folder TEXT NOT NULL,
       trigger_pattern TEXT NOT NULL,
       added_at TEXT NOT NULL,
       container_config TEXT,
@@ -84,60 +84,93 @@ function createSchema(database: Database.Database): void {
     );
   `);
 
-  // Add context_mode column if it doesn't exist (migration for existing DBs)
-  try {
-    database.exec(
-      `ALTER TABLE scheduled_tasks ADD COLUMN context_mode TEXT DEFAULT 'isolated'`,
-    );
-  } catch {
-    /* column already exists */
-  }
+  // Run all migrations inside a transaction so partial failures don't leave
+  // the database in an inconsistent state.
+  const runMigrations = database.transaction(() => {
+    // Drop UNIQUE constraint on folder if it exists (migration for shared folders)
+    const tableInfo = database
+      .prepare(
+        `SELECT sql FROM sqlite_master WHERE type='table' AND name='registered_groups'`,
+      )
+      .get() as { sql: string } | undefined;
+    if (tableInfo?.sql?.includes('UNIQUE')) {
+      database.exec(`
+        CREATE TABLE registered_groups_new (
+          jid TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          folder TEXT NOT NULL,
+          trigger_pattern TEXT NOT NULL,
+          added_at TEXT NOT NULL,
+          container_config TEXT,
+          requires_trigger INTEGER DEFAULT 1,
+          is_main INTEGER DEFAULT 0
+        );
+        INSERT INTO registered_groups_new SELECT * FROM registered_groups;
+        DROP TABLE registered_groups;
+        ALTER TABLE registered_groups_new RENAME TO registered_groups;
+      `);
+      logger.info('Migrated registered_groups: dropped UNIQUE constraint on folder');
+    }
 
-  // Add is_bot_message column if it doesn't exist (migration for existing DBs)
-  try {
-    database.exec(
-      `ALTER TABLE messages ADD COLUMN is_bot_message INTEGER DEFAULT 0`,
-    );
-    // Backfill: mark existing bot messages that used the content prefix pattern
-    database
-      .prepare(`UPDATE messages SET is_bot_message = 1 WHERE content LIKE ?`)
-      .run(`${ASSISTANT_NAME}:%`);
-  } catch {
-    /* column already exists */
-  }
+    // Add context_mode column if it doesn't exist
+    try {
+      database.exec(
+        `ALTER TABLE scheduled_tasks ADD COLUMN context_mode TEXT DEFAULT 'isolated'`,
+      );
+    } catch {
+      /* column already exists */
+    }
 
-  // Add is_main column if it doesn't exist (migration for existing DBs)
-  try {
-    database.exec(
-      `ALTER TABLE registered_groups ADD COLUMN is_main INTEGER DEFAULT 0`,
-    );
-    // Backfill: existing rows with folder = 'main' are the main group
-    database.exec(
-      `UPDATE registered_groups SET is_main = 1 WHERE folder = 'main'`,
-    );
-  } catch {
-    /* column already exists */
-  }
+    // Add is_bot_message column if it doesn't exist
+    try {
+      database.exec(
+        `ALTER TABLE messages ADD COLUMN is_bot_message INTEGER DEFAULT 0`,
+      );
+      database
+        .prepare(`UPDATE messages SET is_bot_message = 1 WHERE content LIKE ?`)
+        .run(`${ASSISTANT_NAME}:%`);
+    } catch {
+      /* column already exists */
+    }
 
-  // Add channel and is_group columns if they don't exist (migration for existing DBs)
+    // Add is_main column if it doesn't exist
+    try {
+      database.exec(
+        `ALTER TABLE registered_groups ADD COLUMN is_main INTEGER DEFAULT 0`,
+      );
+      database.exec(
+        `UPDATE registered_groups SET is_main = 1 WHERE folder = 'main'`,
+      );
+    } catch {
+      /* column already exists */
+    }
+
+    // Add channel and is_group columns if they don't exist
+    try {
+      database.exec(`ALTER TABLE chats ADD COLUMN channel TEXT`);
+      database.exec(`ALTER TABLE chats ADD COLUMN is_group INTEGER DEFAULT 0`);
+      database.exec(
+        `UPDATE chats SET channel = 'whatsapp', is_group = 1 WHERE jid LIKE '%@g.us'`,
+      );
+      database.exec(
+        `UPDATE chats SET channel = 'whatsapp', is_group = 0 WHERE jid LIKE '%@s.whatsapp.net'`,
+      );
+      database.exec(
+        `UPDATE chats SET channel = 'discord', is_group = 1 WHERE jid LIKE 'dc:%'`,
+      );
+      database.exec(
+        `UPDATE chats SET channel = 'telegram', is_group = 1 WHERE jid LIKE 'tg:%'`,
+      );
+    } catch {
+      /* columns already exist */
+    }
+  });
+
   try {
-    database.exec(`ALTER TABLE chats ADD COLUMN channel TEXT`);
-    database.exec(`ALTER TABLE chats ADD COLUMN is_group INTEGER DEFAULT 0`);
-    // Backfill from JID patterns
-    database.exec(
-      `UPDATE chats SET channel = 'whatsapp', is_group = 1 WHERE jid LIKE '%@g.us'`,
-    );
-    database.exec(
-      `UPDATE chats SET channel = 'whatsapp', is_group = 0 WHERE jid LIKE '%@s.whatsapp.net'`,
-    );
-    database.exec(
-      `UPDATE chats SET channel = 'discord', is_group = 1 WHERE jid LIKE 'dc:%'`,
-    );
-    database.exec(
-      `UPDATE chats SET channel = 'telegram', is_group = 1 WHERE jid LIKE 'tg:%'`,
-    );
-  } catch {
-    /* columns already exist */
+    runMigrations();
+  } catch (err) {
+    logger.error({ err }, 'Database migration failed');
+    throw err;
   }
 }
 
@@ -146,6 +179,17 @@ export function initDatabase(): void {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
   db = new Database(dbPath);
+  db.pragma('busy_timeout = 5000');
+  db.pragma('foreign_keys = ON');
+
+  // Integrity check on startup — detect corruption early
+  const integrity = db.pragma('integrity_check') as { integrity_check: string }[];
+  if (integrity.length !== 1 || integrity[0].integrity_check !== 'ok') {
+    const issues = integrity.map((r) => r.integrity_check).join(', ');
+    logger.error({ issues }, 'SQLite integrity check failed');
+    throw new Error(`Database corruption detected: ${issues}`);
+  }
+
   createSchema(db);
 
   // Migrate from JSON files if they exist
@@ -361,6 +405,35 @@ export function getMessagesSince(
   return db
     .prepare(sql)
     .all(chatJid, sinceTimestamp, `${botPrefix}:%`, limit) as NewMessage[];
+}
+
+/**
+ * Get messages since a timestamp from multiple JIDs (for shared folder context).
+ * Same as getMessagesSince but queries across all JIDs sharing a folder.
+ */
+export function getMessagesSinceForFolder(
+  chatJids: string[],
+  sinceTimestamp: string,
+  botPrefix: string,
+  limit: number = 200,
+): NewMessage[] {
+  if (chatJids.length === 0) return [];
+
+  const placeholders = chatJids.map(() => '?').join(',');
+  const sql = `
+    SELECT * FROM (
+      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+      FROM messages
+      WHERE chat_jid IN (${placeholders}) AND timestamp > ?
+        AND is_bot_message = 0 AND content NOT LIKE ?
+        AND content != '' AND content IS NOT NULL
+      ORDER BY timestamp DESC
+      LIMIT ?
+    ) ORDER BY timestamp
+  `;
+  return db
+    .prepare(sql)
+    .all(...chatJids, sinceTimestamp, `${botPrefix}:%`, limit) as NewMessage[];
 }
 
 export function createTask(
@@ -582,6 +655,34 @@ export function getRegisteredGroup(
 export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
   if (!isValidGroupFolder(group.folder)) {
     throw new Error(`Invalid group folder "${group.folder}" for JID ${jid}`);
+  }
+  // Validate consistency with existing JIDs sharing the same folder
+  const existing = db
+    .prepare(
+      'SELECT jid, is_main, container_config FROM registered_groups WHERE folder = ? AND jid != ?',
+    )
+    .all(group.folder, jid) as Array<{
+    jid: string;
+    is_main: number | null;
+    container_config: string | null;
+  }>;
+  if (existing.length > 0) {
+    const existingIsMain = existing[0].is_main === 1;
+    const newIsMain = group.isMain === true;
+    if (existingIsMain !== newIsMain) {
+      throw new Error(
+        `Cannot register JID ${jid} to folder "${group.folder}": isMain mismatch with existing JID ${existing[0].jid}`,
+      );
+    }
+    const existingConfig = existing[0].container_config;
+    const newConfig = group.containerConfig
+      ? JSON.stringify(group.containerConfig)
+      : null;
+    if (existingConfig !== newConfig) {
+      throw new Error(
+        `Cannot register JID ${jid} to folder "${group.folder}": containerConfig mismatch with existing JID ${existing[0].jid}`,
+      );
+    }
   }
   db.prepare(
     `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main)

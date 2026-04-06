@@ -10,13 +10,32 @@ export function escapeXml(s: string): string {
     .replace(/"/g, '&quot;');
 }
 
+/** Derive a short channel tag from a JID prefix. */
+function channelTag(jid: string): string {
+  if (jid.startsWith('dc:')) return '[Discord]';
+  if (jid.startsWith('tg:')) return '[Telegram]';
+  if (jid.endsWith('@g.us') || jid.endsWith('@s.whatsapp.net'))
+    return '[WhatsApp]';
+  if (jid.startsWith('sl:')) return '[Slack]';
+  if (jid.startsWith('sg:')) return '[Signal]';
+  if (jid.startsWith('gm:')) return '[Gmail]';
+  return '';
+}
+
 export function formatMessages(
   messages: NewMessage[],
   timezone: string,
 ): string {
+  // Detect multi-channel messages for attribution
+  const distinctJids = new Set(messages.map((m) => m.chat_jid));
+  const isMultiChannel = distinctJids.size > 1;
+
   const lines = messages.map((m) => {
     const displayTime = formatLocalTime(m.timestamp, timezone);
-    return `<message sender="${escapeXml(m.sender_name)}" time="${escapeXml(displayTime)}">${escapeXml(m.content)}</message>`;
+    const senderName = isMultiChannel
+      ? `${channelTag(m.chat_jid)} ${m.sender_name}`
+      : m.sender_name;
+    return `<message sender="${escapeXml(senderName)}" time="${escapeXml(displayTime)}">${escapeXml(m.content)}</message>`;
   });
 
   const header = `<context timezone="${escapeXml(timezone)}" />\n`;

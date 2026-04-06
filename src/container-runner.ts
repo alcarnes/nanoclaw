@@ -223,6 +223,16 @@ function buildVolumeMounts(
     });
   }
 
+  // Mount second-brain/shared for agent read-write access
+  const sharedDir = path.resolve(projectRoot, '..', 'shared');
+  if (fs.existsSync(sharedDir)) {
+    mounts.push({
+      hostPath: sharedDir,
+      containerPath: '/workspace/shared',
+      readonly: false,
+    });
+  }
+
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
     const validatedMounts = validateAdditionalMounts(
