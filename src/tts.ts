@@ -20,7 +20,7 @@ async function generateOpenAITTS(
   const res = await fetch('https://api.openai.com/v1/audio/speech', {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${apiKey}`,
+      Authorization: `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
@@ -43,7 +43,10 @@ async function generateOpenAITTS(
   const filePath = path.join(outputDir, `tts-${Date.now()}.mp3`);
   fs.writeFileSync(filePath, buffer);
 
-  logger.info({ filePath, textLength: truncated.length, provider: 'openai' }, 'TTS generated');
+  logger.info(
+    { filePath, textLength: truncated.length, provider: 'openai' },
+    'TTS generated',
+  );
   return filePath;
 }
 
@@ -65,7 +68,7 @@ async function generateElevenLabsTTS(
       headers: {
         'xi-api-key': apiKey,
         'Content-Type': 'application/json',
-        'Accept': 'audio/mpeg',
+        Accept: 'audio/mpeg',
       },
       body: JSON.stringify({
         text: truncated,
@@ -90,7 +93,10 @@ async function generateElevenLabsTTS(
   const filePath = path.join(outputDir, `tts-${Date.now()}.mp3`);
   fs.writeFileSync(filePath, buffer);
 
-  logger.info({ filePath, textLength: truncated.length, provider: 'elevenlabs' }, 'TTS generated');
+  logger.info(
+    { filePath, textLength: truncated.length, provider: 'elevenlabs' },
+    'TTS generated',
+  );
   return filePath;
 }
 
@@ -106,7 +112,11 @@ export async function generateTTS(
     }
 
     if (secrets.ELEVENLABS_API_KEY) {
-      return await generateElevenLabsTTS(text, outputDir, secrets.ELEVENLABS_API_KEY);
+      return await generateElevenLabsTTS(
+        text,
+        outputDir,
+        secrets.ELEVENLABS_API_KEY,
+      );
     }
 
     logger.debug('TTS skipped: no ELEVENLABS_API_KEY or OPENAI_API_KEY');
