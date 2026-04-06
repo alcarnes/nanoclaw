@@ -100,6 +100,21 @@ export function ensureContainerRuntimeRunning(): void {
   }
 }
 
+// Track last orphan cleanup time for periodic checks
+let lastOrphanCleanup = 0;
+const ORPHAN_CLEANUP_INTERVAL = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Periodic orphan cleanup — runs at most once per ORPHAN_CLEANUP_INTERVAL.
+ * Safe to call frequently (e.g., from the scheduler loop).
+ */
+export function periodicOrphanCleanup(): void {
+  const now = Date.now();
+  if (now - lastOrphanCleanup < ORPHAN_CLEANUP_INTERVAL) return;
+  lastOrphanCleanup = now;
+  cleanupOrphans();
+}
+
 /** Kill orphaned NanoClaw containers from previous runs. */
 export function cleanupOrphans(): void {
   try {

@@ -25,6 +25,7 @@ export interface IpcDeps {
 }
 
 let ipcWatcherRunning = false;
+let ipcTimer: ReturnType<typeof setTimeout> | null = null;
 
 export function startIpcWatcher(deps: IpcDeps): void {
   if (ipcWatcherRunning) {
@@ -37,6 +38,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
   fs.mkdirSync(ipcBaseDir, { recursive: true });
 
   const processIpcFiles = async () => {
+    if (!ipcWatcherRunning) return;
     // Scan all group IPC directories (identity determined by directory)
     let groupFolders: string[];
     try {
@@ -46,7 +48,9 @@ export function startIpcWatcher(deps: IpcDeps): void {
       });
     } catch (err) {
       logger.error({ err }, 'Error reading IPC base directory');
-      setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
+      if (ipcWatcherRunning) {
+        ipcTimer = setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
+      }
       return;
     }
 
@@ -65,45 +69,64 @@ export function startIpcWatcher(deps: IpcDeps): void {
 
       // Process messages from this group's IPC directory
       try {
-        if (fs.existsSync(messagesDir)) {
-          const messageFiles = fs
+        let messageFiles: string[] = [];
+        try {
+          messageFiles = fs
             .readdirSync(messagesDir)
             .filter((f) => f.endsWith('.json'));
-          for (const file of messageFiles) {
-            const filePath = path.join(messagesDir, file);
-            try {
-              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              if (data.type === 'message' && data.chatJid && data.text) {
-                // Authorization: verify this group can send to this chatJid
-                const targetGroup = registeredGroups[data.chatJid];
-                if (
-                  isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup)
-                ) {
+        } catch {
+          // Directory doesn't exist yet — nothing to process
+        }
+        for (const file of messageFiles) {
+          const filePath = path.join(messagesDir, file);
+          try {
+            const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+            if (data.type === 'message' && data.chatJid && data.text) {
+              // Authorization: verify this group can send to this chatJid
+              const targetGroup = registeredGroups[data.chatJid];
+              if (
+                isMain ||
+                (targetGroup && targetGroup.folder === sourceGroup)
+              ) {
+                try {
                   await deps.sendMessage(data.chatJid, data.text);
                   logger.info(
                     { chatJid: data.chatJid, sourceGroup },
                     'IPC message sent',
                   );
-                } else {
-                  logger.warn(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'Unauthorized IPC message attempt blocked',
+                } catch (sendErr) {
+                  logger.error(
+                    { chatJid: data.chatJid, sourceGroup, err: sendErr },
+                    'IPC message send failed',
                   );
                 }
+              } else {
+                logger.warn(
+                  { chatJid: data.chatJid, sourceGroup },
+                  'Unauthorized IPC message attempt blocked',
+                );
               }
-              fs.unlinkSync(filePath);
-            } catch (err) {
-              logger.error(
-                { file, sourceGroup, err },
-                'Error processing IPC message',
-              );
+            }
+            fs.unlinkSync(filePath);
+          } catch (err) {
+            logger.error(
+              { file, sourceGroup, err },
+              'Error processing IPC message',
+            );
+            try {
               const errorDir = path.join(ipcBaseDir, 'errors');
               fs.mkdirSync(errorDir, { recursive: true });
               fs.renameSync(
                 filePath,
                 path.join(errorDir, `${sourceGroup}-${file}`),
               );
+            } catch {
+              // If we can't move it, try to delete it to prevent infinite retry
+              try {
+                fs.unlinkSync(filePath);
+              } catch {
+                /* give up */
+              }
             }
           }
         }
@@ -116,28 +139,46 @@ export function startIpcWatcher(deps: IpcDeps): void {
 
       // Process tasks from this group's IPC directory
       try {
-        if (fs.existsSync(tasksDir)) {
-          const taskFiles = fs
+        let taskFiles: string[] = [];
+        try {
+          taskFiles = fs
             .readdirSync(tasksDir)
             .filter((f) => f.endsWith('.json'));
-          for (const file of taskFiles) {
-            const filePath = path.join(tasksDir, file);
+        } catch {
+          // Directory doesn't exist yet — nothing to process
+        }
+        for (const file of taskFiles) {
+          const filePath = path.join(tasksDir, file);
+          try {
+            const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+            // Pass source group identity to processTaskIpc for authorization
             try {
-              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              // Pass source group identity to processTaskIpc for authorization
               await processTaskIpc(data, sourceGroup, isMain, deps);
-              fs.unlinkSync(filePath);
-            } catch (err) {
+            } catch (taskErr) {
               logger.error(
-                { file, sourceGroup, err },
-                'Error processing IPC task',
+                { file, sourceGroup, err: taskErr },
+                'processTaskIpc threw unexpectedly',
               );
+            }
+            fs.unlinkSync(filePath);
+          } catch (err) {
+            logger.error(
+              { file, sourceGroup, err },
+              'Error processing IPC task',
+            );
+            try {
               const errorDir = path.join(ipcBaseDir, 'errors');
               fs.mkdirSync(errorDir, { recursive: true });
               fs.renameSync(
                 filePath,
                 path.join(errorDir, `${sourceGroup}-${file}`),
               );
+            } catch {
+              try {
+                fs.unlinkSync(filePath);
+              } catch {
+                /* give up */
+              }
             }
           }
         }
@@ -146,11 +187,22 @@ export function startIpcWatcher(deps: IpcDeps): void {
       }
     }
 
-    setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
+    if (ipcWatcherRunning) {
+      ipcTimer = setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
+    }
   };
 
   processIpcFiles();
   logger.info('IPC watcher started (per-group namespaces)');
+}
+
+export function stopIpcWatcher(): void {
+  ipcWatcherRunning = false;
+  if (ipcTimer) {
+    clearTimeout(ipcTimer);
+    ipcTimer = null;
+  }
+  logger.info('IPC watcher stopped');
 }
 
 export async function processTaskIpc(

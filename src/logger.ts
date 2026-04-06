@@ -12,5 +12,9 @@ process.on('uncaughtException', (err) => {
 });
 
 process.on('unhandledRejection', (reason) => {
-  logger.error({ err: reason }, 'Unhandled rejection');
+  logger.fatal(
+    { err: reason },
+    'Unhandled rejection — exiting so launchd can restart',
+  );
+  process.exit(1);
 });

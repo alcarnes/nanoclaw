@@ -3,11 +3,15 @@ import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
 
 import { ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
+
+// Tasks running longer than this are considered stuck and will be marked as failed
+const STUCK_TASK_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
 import {
   ContainerOutput,
   runContainerAgent,
   writeTasksSnapshot,
 } from './container-runner.js';
+import { periodicOrphanCleanup } from './container-runtime.js';
 import {
   getAllTasks,
   getDueTasks,
@@ -80,6 +84,7 @@ async function runTask(
   deps: SchedulerDependencies,
 ): Promise<void> {
   const startTime = Date.now();
+  markTaskRunning(task.id);
   let groupDir: string;
   try {
     groupDir = resolveGroupFolderPath(task.group_folder);
@@ -109,6 +114,8 @@ async function runTask(
   );
 
   const groups = deps.registeredGroups();
+  // With shared folders, multiple JIDs may match this folder. Any match is
+  // equivalent since isMain and containerConfig are enforced consistent.
   const group = Object.values(groups).find(
     (g) => g.folder === task.group_folder,
   );
@@ -218,6 +225,7 @@ async function runTask(
     logger.error({ taskId: task.id, error }, 'Task failed');
   }
 
+  markTaskDone(task.id);
   const durationMs = Date.now() - startTime;
 
   logTaskRun({
@@ -240,6 +248,19 @@ async function runTask(
 
 let schedulerRunning = false;
 
+let schedulerTimer: ReturnType<typeof setTimeout> | null = null;
+
+// Track when tasks started running for stuck detection
+const runningTasks = new Map<string, number>(); // taskId -> startTime
+
+export function markTaskRunning(taskId: string): void {
+  runningTasks.set(taskId, Date.now());
+}
+
+export function markTaskDone(taskId: string): void {
+  runningTasks.delete(taskId);
+}
+
 export function startSchedulerLoop(deps: SchedulerDependencies): void {
   if (schedulerRunning) {
     logger.debug('Scheduler loop already running, skipping duplicate start');
@@ -249,7 +270,50 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
   logger.info('Scheduler loop started');
 
   const loop = async () => {
+    if (!schedulerRunning) return;
+
     try {
+      // Detect stuck tasks — running longer than the threshold
+      const now = Date.now();
+      for (const [taskId, startTime] of runningTasks) {
+        const elapsed = now - startTime;
+        if (elapsed > STUCK_TASK_THRESHOLD_MS) {
+          logger.error(
+            {
+              taskId,
+              elapsedMs: elapsed,
+              thresholdMs: STUCK_TASK_THRESHOLD_MS,
+            },
+            'Stuck task detected — marking as failed',
+          );
+          markTaskDone(taskId);
+          logTaskRun({
+            task_id: taskId,
+            run_at: new Date(startTime).toISOString(),
+            duration_ms: elapsed,
+            status: 'error',
+            result: null,
+            error: `Task exceeded ${STUCK_TASK_THRESHOLD_MS / 60000}min timeout — marked as stuck`,
+          });
+          // Compute next run so the task isn't permanently stuck
+          const stuckTask = getTaskById(taskId);
+          if (stuckTask) {
+            const nextRun = computeNextRun(stuckTask);
+            updateTaskAfterRun(
+              taskId,
+              nextRun,
+              'Error: task timed out (stuck)',
+            );
+          }
+        }
+      }
+
+      // Recovery sweep: retry groups that previously exhausted max retries
+      deps.queue.recoverFailedGroups();
+
+      // Periodic container orphan cleanup (runs at most every 5 min)
+      periodicOrphanCleanup();
+
       const dueTasks = getDueTasks();
       if (dueTasks.length > 0) {
         logger.info({ count: dueTasks.length }, 'Found due tasks');
@@ -270,10 +334,21 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
       logger.error({ err }, 'Error in scheduler loop');
     }
 
-    setTimeout(loop, SCHEDULER_POLL_INTERVAL);
+    if (schedulerRunning) {
+      schedulerTimer = setTimeout(loop, SCHEDULER_POLL_INTERVAL);
+    }
   };
 
   loop();
+}
+
+export function stopSchedulerLoop(): void {
+  schedulerRunning = false;
+  if (schedulerTimer) {
+    clearTimeout(schedulerTimer);
+    schedulerTimer = null;
+  }
+  logger.info('Scheduler loop stopped');
 }
 
 /** @internal - for tests only. */
