@@ -32,6 +32,7 @@
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.10.0",
     "@vitest/coverage-v8": "^4.0.18",
+    "chromadb": "^3.4.2",
     "husky": "^9.1.7",
     "prettier": "^3.8.1",
     "tsx": "^4.19.0",

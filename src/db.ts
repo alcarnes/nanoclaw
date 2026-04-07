@@ -71,7 +71,8 @@ function createSchema(database: Database.Database): void {
     );
     CREATE TABLE IF NOT EXISTS sessions (
       group_folder TEXT PRIMARY KEY,
-      session_id TEXT NOT NULL
+      session_id TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE TABLE IF NOT EXISTS registered_groups (
       jid TEXT PRIMARY KEY,
@@ -165,6 +166,15 @@ function createSchema(database: Database.Database): void {
       );
     } catch {
       /* columns already exist */
+    }
+
+    // Add updated_at column to sessions for TTL expiry
+    try {
+      database.exec(
+        `ALTER TABLE sessions ADD COLUMN updated_at TEXT NOT NULL DEFAULT (datetime('now'))`,
+      );
+    } catch {
+      /* column already exists */
     }
   });
 
@@ -590,16 +600,34 @@ export function setRouterState(key: string, value: string): void {
 
 // --- Session accessors ---
 
+// Session TTL in milliseconds (default 4 hours)
+const SESSION_TTL_MS = parseInt(
+  process.env.SESSION_TTL_MS || String(4 * 60 * 60 * 1000),
+  10,
+);
+
 export function getSession(groupFolder: string): string | undefined {
   const row = db
-    .prepare('SELECT session_id FROM sessions WHERE group_folder = ?')
-    .get(groupFolder) as { session_id: string } | undefined;
-  return row?.session_id;
+    .prepare('SELECT session_id, updated_at FROM sessions WHERE group_folder = ?')
+    .get(groupFolder) as
+    | { session_id: string; updated_at: string }
+    | undefined;
+  if (!row) return undefined;
+
+  // Check TTL — if the session is older than the threshold, expire it
+  const updatedAt = new Date(row.updated_at + 'Z').getTime(); // SQLite datetime is UTC
+  if (Date.now() - updatedAt > SESSION_TTL_MS) {
+    db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
+    return undefined;
+  }
+
+  return row.session_id;
 }
 
 export function setSession(groupFolder: string, sessionId: string): void {
   db.prepare(
-    'INSERT OR REPLACE INTO sessions (group_folder, session_id) VALUES (?, ?)',
+    `INSERT OR REPLACE INTO sessions (group_folder, session_id, updated_at)
+     VALUES (?, ?, datetime('now'))`,
   ).run(groupFolder, sessionId);
 }
 

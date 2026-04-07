@@ -2,7 +2,7 @@
 # Refresh the OAuth token in .env from the macOS keychain.
 # Claude Code keeps the keychain token fresh when you use it interactively.
 
-ENV_FILE="$HOME/second-brain/nanoclaw/.env"
+ENV_FILE="$HOME/openbrain/nanoclaw/.env"
 
 TOKEN=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['claudeAiOauth']['accessToken'])" 2>/dev/null)
 

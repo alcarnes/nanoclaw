@@ -209,21 +209,7 @@ function buildVolumeMounts(
     readonly: false,
   });
 
-  // Mount second-brain jobs.json so agent can read active job
-  const secondBrainJobsFile = path.resolve(projectRoot, '..', 'jobs.json');
-  if (fs.existsSync(secondBrainJobsFile)) {
-    const sbDir = path.resolve(projectRoot, '..');
-    // Mount the whole second-brain dir so jobs.json path resolves
-    fs.mkdirSync('/tmp/second-brain-mount', { recursive: true });
-    fs.copyFileSync(secondBrainJobsFile, '/tmp/second-brain-mount/jobs.json');
-    mounts.push({
-      hostPath: '/tmp/second-brain-mount',
-      containerPath: '/workspace/second-brain',
-      readonly: true,
-    });
-  }
-
-  // Mount second-brain/shared for agent read-write access
+  // Mount open-brain/shared for agent read-write access
   const sharedDir = path.resolve(projectRoot, '..', 'shared');
   if (fs.existsSync(sharedDir)) {
     mounts.push({
@@ -271,6 +257,9 @@ function buildContainerArgs(
   } else {
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
   }
+
+  // Open Brain API URL for Open Brain tools inside containers
+  args.push('-e', `OPEN_BRAIN_URL=http://${CONTAINER_HOST_GATEWAY}:${process.env.MCP_HTTP_PORT || '3100'}`);
 
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());

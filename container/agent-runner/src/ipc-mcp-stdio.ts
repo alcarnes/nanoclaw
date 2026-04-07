@@ -380,103 +380,28 @@ async function transcribeAudio(filePath: string): Promise<string> {
   return data.text;
 }
 
-// ── Second Brain Tools ──────────────────────────────────────
-// These call ChromaDB and LM Studio over the network from inside the container.
+// ── Open Brain Tools ────────────────────────────────────────
+// These call the Open Brain HTTP API from inside the container.
 // host.docker.internal resolves to the Docker host machine.
 
-const CHROMA_HOST = process.env.CHROMA_URL || 'http://host.docker.internal:8000';
-const LMSTUDIO_HOST = process.env.LMSTUDIO_URL || 'http://host.docker.internal:11234';
-const SB_EMBED_MODEL = process.env.EMBED_MODEL || 'nomic-ai/nomic-embed-text-v2-moe-GGUF';
-
-async function sbEmbed(text: string): Promise<number[]> {
-  const res = await fetch(`${LMSTUDIO_HOST}/v1/embeddings`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: SB_EMBED_MODEL, input: text }),
-  });
-  if (!res.ok) throw new Error(`Embed failed: ${res.statusText}`);
-  const data = await res.json() as { data: Array<{ embedding: number[] }> };
-  return data.data[0].embedding;
-}
-
-async function sbGetActiveJobId(): Promise<number> {
-  // Read jobs.json from the mounted second-brain directory or default to 1
-  try {
-    const jobsPath = '/workspace/second-brain/jobs.json';
-    if (fs.existsSync(jobsPath)) {
-      const jobs = JSON.parse(fs.readFileSync(jobsPath, 'utf-8'));
-      const active = jobs.find((j: { is_active: boolean }) => j.is_active);
-      return active?.id || 1;
-    }
-  } catch {}
-  return 1;
-}
-
-interface ChromaQueryResult {
-  ids: string[][];
-  documents: (string | null)[][];
-  metadatas: (Record<string, unknown> | null)[][];
-  distances: number[][];
-}
-
-async function sbSearchChroma(queryEmbedding: number[], jobId: number, limit: number): Promise<string> {
-  // Get collections
-  const colRes = await fetch(`${CHROMA_HOST}/api/v2/tenants/default_tenant/databases/default_database/collections`);
-  const collections = await colRes.json() as Array<{ id: string; name: string }>;
-
-  const results: Array<{ type: string; title: string; content: string; similarity: number }> = [];
-
-  for (const colName of ['obsidian_files', 'captures']) {
-    const col = collections.find((c: { name: string }) => c.name === colName);
-    if (!col) continue;
-
-    const queryRes = await fetch(
-      `${CHROMA_HOST}/api/v2/tenants/default_tenant/databases/default_database/collections/${col.id}/query`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          query_embeddings: [queryEmbedding],
-          n_results: limit,
-          where: { '$or': [{ job_id: { '$eq': jobId } }, { job_id: { '$eq': 0 } }] },
-          include: ['documents', 'metadatas', 'distances'],
-        }),
-      }
-    );
-
-    if (!queryRes.ok) continue;
-    const data = await queryRes.json() as ChromaQueryResult;
-
-    for (let i = 0; i < (data.ids[0]?.length || 0); i++) {
-      const meta = data.metadatas[0][i] as Record<string, unknown> | null;
-      results.push({
-        type: colName === 'obsidian_files' ? 'obsidian_file' : 'capture',
-        title: (meta?.file_name as string) || data.ids[0][i],
-        content: data.documents[0][i] || '',
-        similarity: 1 - (data.distances[0][i] || 0),
-      });
-    }
-  }
-
-  results.sort((a, b) => b.similarity - a.similarity);
-  return results.slice(0, limit).map((r, i) =>
-    `${i + 1}. [${r.type}] ${r.title} (${(r.similarity * 100).toFixed(1)}%)\n   ${r.content}`
-  ).join('\n\n') || 'No results found.';
-}
+const OPEN_BRAIN_URL = process.env.OPEN_BRAIN_URL || 'http://host.docker.internal:3100';
 
 server.tool(
   'semantic_search',
-  'Search the user\'s second brain (Obsidian notes and captures) using semantic similarity.',
+  'Search Open Brain (captures, documents, consolidated notes) using semantic similarity.',
   {
     query: z.string().describe('Natural language search query'),
     limit: z.number().optional().default(10).describe('Max results'),
   },
   async (args) => {
     try {
-      const jobId = await sbGetActiveJobId();
-      const embedding = await sbEmbed(args.query);
-      const text = await sbSearchChroma(embedding, jobId, args.limit || 10);
-      return { content: [{ type: 'text' as const, text }] };
+      const res = await fetch(`${OPEN_BRAIN_URL}/api/search`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: args.query, limit: args.limit || 10 }),
+      });
+      const data = await res.json() as { text: string };
+      return { content: [{ type: 'text' as const, text: data.text }] };
     } catch (err) {
       return { content: [{ type: 'text' as const, text: `Search error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
     }
@@ -484,58 +409,51 @@ server.tool(
 );
 
 server.tool(
+  'query_structured_data',
+  'Query structured data from Open Brain (workouts, sleep, nutrition, media) by type and date range. Use this for fitness data, health tracking, media logs, etc.',
+  {
+    type: z.string().describe('Structured type to query (e.g., workout, sleep, nutrition, media)'),
+    date_from: z.string().optional().describe('Start date (ISO format, e.g., 2025-03-25)'),
+    date_to: z.string().optional().describe('End date (ISO format, e.g., 2026-04-06)'),
+    limit: z.number().optional().default(20).describe('Max entries to return'),
+  },
+  async (args) => {
+    try {
+      const res = await fetch(`${OPEN_BRAIN_URL}/api/structured/query`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: args.type, date_from: args.date_from, date_to: args.date_to, limit: args.limit }),
+      });
+      const data = await res.json() as { results: Array<Record<string, unknown>> };
+      if (!data.results?.length) {
+        return { content: [{ type: 'text' as const, text: `No ${args.type} entries found.` }] };
+      }
+      const text = data.results.map((r: Record<string, unknown>, i: number) =>
+        `${i + 1}. ${JSON.stringify(r.data)} (${r.created_at})`
+      ).join('\n\n');
+      return { content: [{ type: 'text' as const, text }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Query error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
   'add_capture',
-  'Capture a quick thought or note into the user\'s second brain.',
+  'Capture a thought or note to Open Brain. Automatically classifies and extracts metadata.',
   {
     content: z.string().describe('The thought or note to capture'),
     is_personal: z.boolean().optional().default(false).describe('True for personal, false for work'),
   },
   async (args) => {
     try {
-      const jobId = args.is_personal ? 0 : await sbGetActiveJobId();
-      const embedding = await sbEmbed(args.content);
-
-      // Get captures collection
-      const colRes = await fetch(`${CHROMA_HOST}/api/v2/tenants/default_tenant/databases/default_database/collections`);
-      const collections = await colRes.json() as Array<{ id: string; name: string }>;
-      const capturesCol = collections.find((c: { name: string }) => c.name === 'captures');
-      if (!capturesCol) throw new Error('Captures collection not found');
-
-      const id = `capture-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      await fetch(
-        `${CHROMA_HOST}/api/v2/tenants/default_tenant/databases/default_database/collections/${capturesCol.id}/add`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            ids: [id],
-            documents: [args.content],
-            embeddings: [embedding],
-            metadatas: [{ job_id: jobId, created_at: new Date().toISOString() }],
-          }),
-        }
-      );
-
-      // Write to Obsidian vault via credential proxy (non-fatal)
-      try {
-        const proxyBase = process.env.ANTHROPIC_BASE_URL || 'http://host.docker.internal:3001';
-        const date = new Date().toISOString().split('T')[0];
-        const filename = `Captures/${date}-${id}.md`;
-        const obsRes = await fetch(`${proxyBase}/obsidian/vault/${filename}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'text/markdown' },
-          body: args.content,
-        });
-        if (!obsRes.ok) {
-          console.error(`[nanoclaw-mcp] Obsidian write failed: ${obsRes.status} ${obsRes.statusText}`);
-        } else {
-          console.error(`[nanoclaw-mcp] Obsidian write OK: ${filename}`);
-        }
-      } catch (obsErr) {
-        console.error(`[nanoclaw-mcp] Obsidian write error: ${obsErr instanceof Error ? obsErr.message : String(obsErr)}`);
-      }
-
-      return { content: [{ type: 'text' as const, text: `Captured: "${args.content.slice(0, 80)}..."` }] };
+      const res = await fetch(`${OPEN_BRAIN_URL}/api/capture`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: args.content, is_personal: args.is_personal }),
+      });
+      const data = await res.json() as { text: string };
+      return { content: [{ type: 'text' as const, text: data.text }] };
     } catch (err) {
       return { content: [{ type: 'text' as const, text: `Capture error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
     }
